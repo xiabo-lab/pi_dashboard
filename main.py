@@ -136,15 +136,31 @@ LOCATION_LAT = 51.4779   # 00000 fallback, used only if the ZIP lookup is down
 LOCATION_LON = -0.0015
 LOCATION_LABEL = 'Greenwich'
 
+# Per-device credentials (printer serial / LAN access code, Roborock account)
+# are read from device_conf.json, which is gitignored so they never reach the
+# repo. Copy device_conf.example.json to device_conf.json and fill it in; the
+# defaults below leave the relevant widget disabled if the file is absent.
+DEVICE_CONF_FILE = os.path.join(BASE_DIR, 'device_conf.json')
+
 PRINTER_CONF = {
-    'IP': '10.0.0.x',
-    'SERIAL': 'your-bambu-serial',
-    'ACCESS_CODE': 'your-lan-access-code'
+    'IP': '',
+    'SERIAL': '',
+    'ACCESS_CODE': ''
 }
 
 ROBOROCK_CONF = {
-    'EMAIL': 'email...'
+    'EMAIL': ''
 }
+
+try:
+    with open(DEVICE_CONF_FILE) as _f:
+        _device_conf = json.load(_f)
+    PRINTER_CONF.update(_device_conf.get('printer', {}))
+    ROBOROCK_CONF.update(_device_conf.get('roborock', {}))
+except FileNotFoundError:
+    pass
+except (OSError, ValueError) as _e:
+    print(f"Warning: could not read {DEVICE_CONF_FILE}: {_e}", file=sys.stderr)
 
 LASTFM_CONF = {
     'API_KEY': '',

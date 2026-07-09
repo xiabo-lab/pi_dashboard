@@ -115,7 +115,7 @@ The service runs `claude.py` every 10 minutes to refresh usage; the token self-r
 **You DON'T need to enable "LAN Mode" on your Bambu Lab printer to access local data.**
 1. On your printer's screen, go to **Settings -> Network**.
 2. Note your printer's **IP Address**, **Serial Number**, and **Access Code**. (Force on your router to map exact IP address)
-3. Update the `PRINTER_CONF` dictionary in the script with these local credentials.
+3. Copy `device_conf.example.json` to `device_conf.json` and fill in the `printer` block with these local credentials. That file is gitignored, so the credentials stay out of the repo; without it the printer widget simply stays offline.
 
 ### Spotify (via Last.fm)
 Since the official Spotify API requires running a local web server for complex token renewals, this dashboard uses Last.fm to fetch the current playing track reliably form Spotify. It's is transparent and working method.

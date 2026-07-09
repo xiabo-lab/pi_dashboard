@@ -2,6 +2,7 @@
 token.json
 credentials.json
 claude_creds.json
+device_conf.json
 strava_token.json
 roborock_session.pkl
 *.pkl

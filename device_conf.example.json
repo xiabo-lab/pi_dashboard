@@ -1,0 +1,10 @@
+{
+  "printer": {
+    "IP": "10.0.0.x",
+    "SERIAL": "your-bambu-serial",
+    "ACCESS_CODE": "your-lan-access-code"
+  },
+  "roborock": {
+    "EMAIL": "you@example.com"
+  }
+}
