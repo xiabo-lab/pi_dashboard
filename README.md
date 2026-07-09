@@ -209,7 +209,7 @@ Hold the screen for **5 seconds** to open Settings — useful for changes when y
 
 ### Screensaver (idle)
 
-After `SCREENSAVER_SECONDS` (default **1800** = 30 min) with no touch, the dashboard is replaced by a **moving-clock screensaver** — a time / day / date block drifting and bouncing on a black background — and the first touch returns to the dashboard. **The dashboard keeps running underneath**, so it repaints instantly with fresh data on touch. Set `SCREENSAVER_SECONDS = 0` to keep the dashboard on permanently.
+After `SCREENSAVER_SECONDS` (default **600** = 10 min) with no touch, the dashboard is replaced by a **moving-clock screensaver** — a time / day / date block drifting and bouncing on a black background — and the first touch returns to the dashboard. **The dashboard keeps running underneath**, so it repaints instantly with fresh data on touch. Set `SCREENSAVER_SECONDS = 0` to keep the dashboard on permanently.
 
 Why a moving clock rather than actually powering the panel off: this GeeekPi LCD exposes **no backlight control** (`/sys/class/backlight` is empty), ignores `vcgencmd display_power` under KMS, and **does not support HDMI-CEC** (it NACKs CEC commands). Cutting the HDMI signal (`wlr-randr --off`) doesn't put it to sleep either — it just shows a "No Signal" OSD with the backlight still lit. So there is no software way to turn this panel's backlight off; the drifting clock is the best available option — it avoids the OSD and prevents burn-in from static content, though the backlight stays on. For true power-off you'd need a hardware switch (smart plug / GPIO relay) on the panel's power.
 
@@ -225,7 +225,7 @@ The dashboard is built on a robust, multi-threaded architecture designed to keep
 **Important Notes:**
 
 * **Initial Data Population Delay:** When you first launch the script, you will notice that the widgets may show placeholders or zeros, and the full array of data takes a few minutes to completely appear on the screen. This is an intentional design choice to stagger initial network requests. It prevents sudden spikes in CPU usage, avoids overwhelming the Raspberry Pi's network stack, and respects the rate limits of the external APIs.
-* **Panel burn-in / backlight life:** LCDs do not ghost like e-paper, but a static dashboard left on around the clock can cause image retention. The idle **screensaver** described above (moving clock after 30 min, tune `SCREENSAVER_SECONDS`) prevents that. It can't reduce backlight hours, though — this panel has no software backlight/power control (see that section).
+* **Panel burn-in / backlight life:** LCDs do not ghost like e-paper, but a static dashboard left on around the clock can cause image retention. The idle **screensaver** described above (moving clock after 10 min, tune `SCREENSAVER_SECONDS`) prevents that. It can't reduce backlight hours, though — this panel has no software backlight/power control (see that section).
 
 ## Migrating from the e-paper build
 

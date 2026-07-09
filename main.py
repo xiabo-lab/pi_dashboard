@@ -90,7 +90,7 @@ TAP_REFRESH_COOLDOWN = 15
 # no backlight control and no CEC, and cutting the HDMI signal just makes it show
 # a "No Signal" OSD - so we keep the signal on and drift the clock to avoid
 # burn-in. The dashboard keeps running underneath. Set 0 to disable.
-SCREENSAVER_SECONDS = 1800   # 30 minutes
+SCREENSAVER_SECONDS = 600    # 10 minutes
 SCREENSAVER_FRAME_S = 0.1    # screensaver redraw interval (~10 fps drift)
 
 # After waking, ignore tap/hold *actions* for this long so the touch that woke
