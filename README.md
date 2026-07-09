@@ -231,7 +231,7 @@ The dashboard is built on a robust, multi-threaded architecture designed to keep
 
 If you are coming from the Waveshare 10.85" version:
 
-* **`display.py` replaces `lib/waveshare_epd/`.** The `epd10in85` driver, its `.so` blobs, and the SPI setup are no longer imported by anything. The directory is left in place so you can roll back; delete it once you are happy with the LCD.
+* **`display.py` replaces the old e-paper driver.** The `epd10in85` driver, its `.so` blobs, and the SPI setup are no longer imported by anything. They've been moved to `Reference/waveshare_epd/` (off the import path) for rollback; delete `Reference/` once you are happy with the LCD.
 * **Geometry changed** from 1360x480 to 1920x440. The panel is 560px wider but 40px shorter, so the layout moved from 3 columns to 4 (activity/finance · home & AI usage · weather · clock/mail/status) and each column's vertical budget was tightened.
 * **Colour replaces 1-bit.** Icons are now loaded as alpha masks and painted in whatever colour the theme specifies, so the same `icons/*.bmp` files are reused unmodified. Mask polarity is detected per icon (most are dark-on-light, but `icon_wifi.bmp` ships light-on-dark). Spotify album art is kept as full-colour RGB instead of being dithered to 1-bit.
 * **`signal.SIGALRM` hardware watchdog removed.** It existed to recover from the e-paper's SPI busy-wait hangs; an HDMI blit cannot hang that way.
