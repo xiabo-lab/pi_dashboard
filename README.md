@@ -188,7 +188,7 @@ sudo systemctl restart pi-dashboard
 | Tap | Force an immediate refetch of all data (rate-limited to once every 15s) |
 | Press & hold (~1.2s) | Toggle light / dark theme |
 | Press & hold **5s** | Open the **Settings menu** (a progress bar fills as you hold) |
-| Tap while the screen is off | Wake the panel (this touch only wakes; it does not also refresh/toggle) |
+| Tap during the screensaver | Return to the dashboard (this touch only wakes; it does not also refresh/toggle) |
 | `R` / `T` / `S` / `Esc`,`Q` | Refresh / toggle theme / settings / quit (when a keyboard is attached) |
 
 ### Bluetooth music widget
@@ -207,11 +207,11 @@ Hold the screen for **5 seconds** to open Settings — useful for changes when y
 
 `Close` returns to the dashboard. Everything runs as root under the service, so no sudo prompt; the settings menu (like WiFi) requires the app to be running under `cage` (it can't be driven over SSH).
 
-### Screen power-saving
+### Screensaver (idle)
 
-To spare the backlight, the panel turns **fully off** after `SCREEN_OFF_SECONDS` (default **1800** = 30 min) with no touch, and wakes on the next touch. This is a real signal-off (`wlr-randr --off` drops the HDMI output so the panel enters standby and the backlight goes dark) — not a black frame. **The dashboard keeps running in the background while the screen is off**; only the panel sleeps, so it repaints instantly with fresh data on wake.
+After `SCREENSAVER_SECONDS` (default **1800** = 30 min) with no touch, the dashboard is replaced by a **moving-clock screensaver** — a time / day / date block drifting and bouncing on a black background — and the first touch returns to the dashboard. **The dashboard keeps running underneath**, so it repaints instantly with fresh data on touch. Set `SCREENSAVER_SECONDS = 0` to keep the dashboard on permanently.
 
-Waking reads the kernel touch device (`/dev/input/by-id/…ILITEK…`) directly in a background thread, so it works even though the compositor has no surface to route touches to while the output is down. Set `SCREEN_OFF_SECONDS = 0` to keep the screen on permanently.
+Why a moving clock rather than actually powering the panel off: this GeeekPi LCD exposes **no backlight control** (`/sys/class/backlight` is empty), ignores `vcgencmd display_power` under KMS, and **does not support HDMI-CEC** (it NACKs CEC commands). Cutting the HDMI signal (`wlr-randr --off`) doesn't put it to sleep either — it just shows a "No Signal" OSD with the backlight still lit. So there is no software way to turn this panel's backlight off; the drifting clock is the best available option — it avoids the OSD and prevents burn-in from static content, though the backlight stays on. For true power-off you'd need a hardware switch (smart plug / GPIO relay) on the panel's power.
 
 > This needs `wlr-randr` (`sudo apt install wlr-randr`) and the app running under `cage` as root (both already true for the systemd unit). If `wlr-randr` or the touch device isn't found, the feature disables itself and the screen simply stays on — it will never get stuck dark.
 
@@ -225,7 +225,7 @@ The dashboard is built on a robust, multi-threaded architecture designed to keep
 **Important Notes:**
 
 * **Initial Data Population Delay:** When you first launch the script, you will notice that the widgets may show placeholders or zeros, and the full array of data takes a few minutes to completely appear on the screen. This is an intentional design choice to stagger initial network requests. It prevents sudden spikes in CPU usage, avoids overwhelming the Raspberry Pi's network stack, and respects the rate limits of the external APIs.
-* **Panel burn-in / backlight life:** LCDs do not ghost like e-paper, but a static dashboard left on around the clock wears the LED backlight and can cause image retention. The screen power-saving described above (off after 30 min idle, wake on touch) addresses this; tune `SCREEN_OFF_SECONDS` to taste.
+* **Panel burn-in / backlight life:** LCDs do not ghost like e-paper, but a static dashboard left on around the clock can cause image retention. The idle **screensaver** described above (moving clock after 30 min, tune `SCREENSAVER_SECONDS`) prevents that. It can't reduce backlight hours, though — this panel has no software backlight/power control (see that section).
 
 ## Migrating from the e-paper build
 

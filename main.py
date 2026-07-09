@@ -15,6 +15,7 @@ import pickle
 import argparse
 import subprocess
 import math
+import random
 import calendar
 import urllib.parse
 from collections import deque
@@ -83,10 +84,14 @@ EVENT_POLL_FPS = 30
 # Minimum seconds between touch-triggered data refetches.
 TAP_REFRESH_COOLDOWN = 15
 
-# Turn the panel physically off after this many seconds with no touch, to save
-# the backlight's lifetime; a touch wakes it. The dashboard keeps running in the
-# background while the screen is off. Set 0 to keep the screen on permanently.
-SCREEN_OFF_SECONDS = 1800  # 30 minutes
+# After this many seconds with no touch, show a moving-clock screensaver (a
+# time/day/date block drifting on black) instead of the dashboard; a touch
+# returns to the dashboard. This panel can't be powered off in software - it has
+# no backlight control and no CEC, and cutting the HDMI signal just makes it show
+# a "No Signal" OSD - so we keep the signal on and drift the clock to avoid
+# burn-in. The dashboard keeps running underneath. Set 0 to disable.
+SCREENSAVER_SECONDS = 1800   # 30 minutes
+SCREENSAVER_FRAME_S = 0.1    # screensaver redraw interval (~10 fps drift)
 
 # After waking, ignore tap/hold *actions* for this long so the touch that woke
 # the screen doesn't also refresh data or flip the theme.
@@ -1704,6 +1709,61 @@ def widget_clock_panel(img, draw, col, dt, gmail_unread, updated_at):
     draw_text_right(draw, right, 372, "tap: refresh | hold: theme | 5s: settings", FONTS['16'], THEME['line'])
 
 
+# --- Screensaver (moving clock on black; prevents burn-in without an OSD) ---
+SS_TIME_COLOR = (120, 175, 255)
+SS_DATE_COLOR = (120, 130, 150)
+SS_SPEED = 55.0  # drift speed, px/sec
+
+
+def render_screensaver(pos):
+    """Black frame with a time/day/date block at pos. Returns (img, w, h)."""
+    dt = datetime.now()
+    img = Image.new('RGB', (SCREEN_W, SCREEN_H), (0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    t_str = dt.strftime("%H:%M:%S")
+    d_str = dt.strftime("%A  %d %B %Y").upper()
+    tf, df = FONTS['ss_clock'], FONTS['32']
+    tb = draw.textbbox((0, 0), t_str, font=tf)
+    db = draw.textbbox((0, 0), d_str, font=df)
+    tw, th = tb[2] - tb[0], tb[3] - tb[1]
+    dw, dh = db[2] - db[0], db[3] - db[1]
+    gw, gap = max(tw, dw), 18
+    gh = th + gap + dh
+    x, y = int(pos[0]), int(pos[1])
+    draw.text((x + (gw - tw) // 2 - tb[0], y - tb[1]), t_str, font=tf, fill=SS_TIME_COLOR)
+    draw.text((x + (gw - dw) // 2 - db[0], y + th + gap - db[1]), d_str, font=df, fill=SS_DATE_COLOR)
+    return img, gw, gh
+
+
+def screensaver_start():
+    gw, gh = 480, 150  # rough size; refined by the first frame's bounce
+    pos = [float(random.randint(0, max(1, SCREEN_W - gw))),
+           float(random.randint(0, max(1, SCREEN_H - gh)))]
+    ang = random.uniform(0, 2 * math.pi)
+    return pos, [SS_SPEED * math.cos(ang), SS_SPEED * math.sin(ang)]
+
+
+def screensaver_step(pos, vel, gw, gh, dt_s):
+    """Advance and bounce the block; a small random turn on each bounce makes
+    the path wander so it covers more of the panel over time."""
+    pos[0] += vel[0] * dt_s
+    pos[1] += vel[1] * dt_s
+    bounced = False
+    if pos[0] < 0:
+        pos[0], vel[0], bounced = 0.0, abs(vel[0]), True
+    elif pos[0] + gw > SCREEN_W:
+        pos[0], vel[0], bounced = float(SCREEN_W - gw), -abs(vel[0]), True
+    if pos[1] < 0:
+        pos[1], vel[1], bounced = 0.0, abs(vel[1]), True
+    elif pos[1] + gh > SCREEN_H:
+        pos[1], vel[1], bounced = float(SCREEN_H - gh), -abs(vel[1]), True
+    if bounced:
+        a = random.uniform(-0.35, 0.35)
+        vx, vy = vel
+        vel[0] = vx * math.cos(a) - vy * math.sin(a)
+        vel[1] = vx * math.sin(a) + vy * math.cos(a)
+
+
 def _music_hit(pos):
     """Return the music transport control at pos ('prev'/'playpause'/'next'), or None."""
     px, py = pos
@@ -1825,6 +1885,7 @@ def load_fonts():
         '60': load('Aldrich-Regular.ttc', 60),
         '80': load('Aldrich-Regular.ttc', 80),
         'clock': load('advanced_led_board-7.ttc', 170),
+        'ss_clock': load('advanced_led_board-7.ttc', 96),  # screensaver clock
         'cjk': load_cjk(30),
         'cjk_sm': load_cjk(23),
     }
@@ -1887,8 +1948,9 @@ def main():
         logging.critical("Try `python3 main.py --preview` to check rendering without a display.")
         return
 
-    # Screen power: turn the panel off when idle, wake it on touch. The touch
-    # thread updates `activity['t']` (monotonic) from the kernel touch device.
+    # Idle -> moving-clock screensaver (see SCREENSAVER_SECONDS). `activity['t']`
+    # (monotonic) is bumped by touches; ScreenPower is kept only for its kernel
+    # touch reader, which feeds note_activity as a backup to pygame's events.
     activity = {'t': time.monotonic()}
 
     def note_activity():
@@ -1903,29 +1965,31 @@ def main():
     last_key = None
     last_forced = 0.0
     wake_time = 0.0
-    screen_was_on = True
     frames = 0
-    menu = None           # settings_ui.SettingsUI instance while open, else None
+    menu = None            # settings_ui.SettingsUI instance while open, else None
     last_menu_draw = 0.0
+    saver = False          # screensaver active?
+    ss_pos, ss_vel = [0.0, 0.0], [0.0, 0.0]
+    ss_last = 0.0
 
     try:
         while True:
             force = False
             now_m = time.monotonic()
 
-            # Detect a wake done by the touch thread (before handling events, so
-            # the waking touch is inside the guard window below) and repaint.
-            is_on = power.is_on
-            if is_on and not screen_was_on:
-                wake_time = now_m
-                last_key = None  # force a full repaint after the blank
-            screen_was_on = is_on
-
             for kind, pos in screen.poll():
                 if kind == display_backend.QUIT:
                     raise KeyboardInterrupt
                 note_activity()
-                # Swallow the action of the touch that woke the screen.
+
+                # A touch during the screensaver only wakes it; swallow the
+                # action so it doesn't also refresh / toggle / hit a control.
+                if saver:
+                    saver = False
+                    wake_time = now_m
+                    last_key = None
+                    force = True
+                    continue
                 if now_m - wake_time < WAKE_GUARD_SECONDS:
                     force = True
                     continue
@@ -1942,7 +2006,6 @@ def main():
 
                 if kind == display_backend.SETTINGS:
                     logging.info("Entering settings")
-                    power.screen_on()
                     menu = settings_ui.SettingsUI(FONTS, THEME, SCREEN_W, SCREEN_H,
                                                   settings_ctx)
                     force = True
@@ -1964,7 +2027,7 @@ def main():
                     last_forced = time.time()
                 force = True
 
-            # --- Settings mode: render the menu/sub-screen, never sleep ---
+            # --- Settings mode: render the menu/sub-screen ---
             if menu is not None:
                 if menu.dirty or (menu.animating and now_m - last_menu_draw > 0.25):
                     try:
@@ -1976,57 +2039,72 @@ def main():
                 screen.tick(EVENT_POLL_FPS)
                 continue
 
-            # Once idle long enough, cut the HDMI signal (backlight off). The
-            # data threads keep running; only the panel sleeps.
-            if is_on and SCREEN_OFF_SECONDS and (now_m - activity['t'] > SCREEN_OFF_SECONDS):
-                power.screen_off()
-                is_on = screen_was_on = False
+            # --- Enter / exit the screensaver ---
+            idle = SCREENSAVER_SECONDS and (now_m - activity['t'] > SCREENSAVER_SECONDS)
+            if idle and not saver:
+                saver = True
+                ss_pos, ss_vel = screensaver_start()
+                ss_last = 0.0
+            elif not idle and saver:
+                saver = False
+                wake_time = now_m      # guard the pygame touch that follows
+                last_key = None        # repaint the dashboard
 
-            # A hold heading toward the 5s WiFi gesture: show a progress hint.
-            hold = screen.hold_seconds() if is_on else 0.0
+            if saver:
+                if now_m - ss_last >= SCREENSAVER_FRAME_S:
+                    dt_s = (now_m - ss_last) if ss_last else SCREENSAVER_FRAME_S
+                    ss_last = now_m
+                    try:
+                        img, gw, gh = render_screensaver(ss_pos)
+                        screen.show(img)
+                        del img
+                        screensaver_step(ss_pos, ss_vel, gw, gh, dt_s)
+                    except Exception as e:
+                        logging.error(f"Screensaver error: {e}")
+                screen.tick(EVENT_POLL_FPS)
+                continue
+
+            # A hold heading toward the 5s settings gesture: show a progress hint.
+            hold = screen.hold_seconds()
             hinting = hold >= 2.5
             if hinting:
                 force = True
 
-            # Re-render only when the screen is on and something visible changed:
-            # the minute, the data revision, the theme, or a touch. While music
-            # is playing, add a per-second tick so the progress bar advances.
-            if is_on:
-                if bt:
-                    _snap = bt.music_snapshot()
-                    # Repaint on status/track change, and every second while
-                    # playing so the progress bar advances.
-                    music_key = (_snap['status'], _snap['title'],
-                                 int(now_m) if _snap['status'] == 'playing' else 0)
-                else:
-                    music_key = None
-                key = (datetime.now().strftime('%H:%M'), data_store.rev, THEME_NAME, music_key)
-                if force or key != last_key:
-                    try:
-                        image = render_screen()
-                        if hinting:
-                            draw_hold_hint(image, hold / display_backend.SETTINGS_HOLD_SEC)
-                        screen.show(image)
-                        del image
-                        last_key = None if hinting else key
-                        frames += 1
-                        if frames % 60 == 0:
-                            gc.collect()
-                    except OSError as e:
-                        if e.errno == 24:  # too many open fds - restart clean
-                            logging.critical("FD exhaustion, restarting")
-                            logging.shutdown()
-                            os.execv(sys.executable, ['python3'] + sys.argv)
-                        logging.error(f"Render error: {e}")
-                    except Exception as e:
-                        logging.error(f"Unexpected error in main: {e}")
+            # Re-render only when something visible changed: the minute, the data
+            # revision, the theme, or a touch. While music is playing, add a
+            # per-second tick so the progress bar advances.
+            if bt:
+                _snap = bt.music_snapshot()
+                music_key = (_snap['status'], _snap['title'],
+                             int(now_m) if _snap['status'] == 'playing' else 0)
+            else:
+                music_key = None
+            key = (datetime.now().strftime('%H:%M'), data_store.rev, THEME_NAME, music_key)
+            if force or key != last_key:
+                try:
+                    image = render_screen()
+                    if hinting:
+                        draw_hold_hint(image, hold / display_backend.SETTINGS_HOLD_SEC)
+                    screen.show(image)
+                    del image
+                    last_key = None if hinting else key
+                    frames += 1
+                    if frames % 60 == 0:
+                        gc.collect()
+                except OSError as e:
+                    if e.errno == 24:  # too many open fds - restart clean
+                        logging.critical("FD exhaustion, restarting")
+                        logging.shutdown()
+                        os.execv(sys.executable, ['python3'] + sys.argv)
+                    logging.error(f"Render error: {e}")
+                except Exception as e:
+                    logging.error(f"Unexpected error in main: {e}")
 
             screen.tick(EVENT_POLL_FPS)
 
     except KeyboardInterrupt:
         pass
     finally:
-        power.screen_on()  # never leave the panel dark for the next run
         screen.close()
 
 
