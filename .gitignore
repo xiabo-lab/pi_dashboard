@@ -1,0 +1,31 @@
+# --- Secrets / credentials (never commit) ---
+token.json
+credentials.json
+claude_creds.json
+strava_token.json
+roborock_session.pkl
+*.pkl
+
+# --- Runtime state written by the app ---
+settings.json
+usage.json
+limits.json
+roborock_stats.json
+
+# --- Logs ---
+*.log
+dashboard.log
+claude_monitor.log
+
+# --- Python caches ---
+__pycache__/
+*.py[cod]
+*.pyo
+
+# --- Render/preview artifacts ---
+preview.png
+*.tmp
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db

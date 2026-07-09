@@ -1,0 +1,2034 @@
+#!/usr/bin/python3
+# -*- coding:utf-8 -*-
+import sys
+import os
+import time
+import logging
+import threading
+import requests
+import io
+import gc
+import socket
+import json
+import asyncio
+import pickle
+import argparse
+import subprocess
+import math
+import calendar
+import urllib.parse
+from collections import deque
+from datetime import datetime, timezone
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+from logging.handlers import RotatingFileHandler
+
+# --- GMAIL IMPORTS ---
+# Optional, like the bambu/roborock imports below: the Gmail widget degrades to
+# "Unread Inbox: 0" if the google libraries are absent. A hard import here would
+# crash-loop the systemd service on a Pi that never had them installed.
+try:
+    from googleapiclient.discovery import build
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+
+    GMAIL_AVAILABLE = True
+except ImportError:
+    GMAIL_AVAILABLE = False
+
+# --- SYSTEM LIMITS (POSIX only; skipped when previewing on a dev box) ---
+try:
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+except Exception as e:
+    print(f"Failed to set rlimit: {e}")
+
+# --- VERSION ---
+APP_VERSION = '1.2.0'  # 1.2: Bluetooth music widget + Bluetooth settings
+
+# --- PATHS ---
+BASE_DIR = os.path.dirname(os.path.realpath(__file__))
+LIB_DIR = os.path.join(BASE_DIR, 'lib')
+FONT_DIR = os.path.join(BASE_DIR, 'fnt')
+ICON_DIR = os.path.join(BASE_DIR, 'icons')
+LOG_FILE = os.path.join(BASE_DIR, 'dashboard.log')
+# Runtime settings editable from the on-screen menu (currently just the ZIP),
+# kept separate from the code defaults so an on-screen change survives restarts.
+SETTINGS_FILE = os.path.join(BASE_DIR, 'settings.json')
+
+# ######################
+# --- WIDGET TOGGLES ---
+# ######################
+ENABLE_STRAVA = False
+ENABLE_BAMBU = True
+ENABLE_ROBOROCK = False
+ENABLE_ANTIGRAVITY = False
+ENABLE_CLAUDE = True
+ENABLE_SPOTIFY = False
+
+# ######################
+# --- DISPLAY CONFIG ---
+# ######################
+# GeeekPi 11.26" HDMI LCD, 1920x440, capacitive touch.
+SCREEN_W = 1920
+SCREEN_H = 440
+
+# The LCD redraws instantly, so we can re-render as soon as anything changes
+# instead of the e-paper's 60s partial-refresh cadence. The loop spins at
+# EVENT_POLL_FPS to keep touch responsive, but a frame is only *rendered* when
+# the clock minute, the data revision, or the theme actually moves.
+EVENT_POLL_FPS = 30
+
+# Minimum seconds between touch-triggered data refetches.
+TAP_REFRESH_COOLDOWN = 15
+
+# Turn the panel physically off after this many seconds with no touch, to save
+# the backlight's lifetime; a touch wakes it. The dashboard keeps running in the
+# background while the screen is off. Set 0 to keep the screen on permanently.
+SCREEN_OFF_SECONDS = 1800  # 30 minutes
+
+# After waking, ignore tap/hold *actions* for this long so the touch that woke
+# the screen doesn't also refresh data or flip the theme.
+WAKE_GUARD_SECONDS = 1.5
+
+# --- API ENDPOINTS ---
+API_ENDPOINTS = {
+    'weather': 'https://api.open-meteo.com/v1/forecast',
+    'aqi': 'https://air-quality-api.open-meteo.com/v1/air-quality',
+    'geo_city': 'https://geocoding-api.open-meteo.com/v1/search',
+    'geo_zip': 'https://api.zippopotam.us',  # /<country>/<zip> -> lat/lon + place
+    'geo_ip': 'http://ip-api.com/json/?fields=status,lat,lon,city,regionName,countryCode',
+    'strava_token': 'https://www.strava.com/oauth/token',
+    'strava_auth': 'https://www.strava.com/oauth/authorize',
+    'strava_activities': 'https://www.strava.com/api/v3/athlete/activities',
+    'yahoo_chart': 'https://query1.finance.yahoo.com/v8/finance/chart/',
+    'lastfm': 'http://ws.audioscrobbler.com/2.0/'
+}
+
+# --- CONFIGURATION ---
+# Weather location, resolved in this priority order (first one that succeeds
+# wins; re-checked about once a day):
+#
+#   1. LOCATION_ZIP    - a postal code, resolved to coordinates via zippopotam.us.
+#                        Most precise for a fixed spot. Open-Meteo's own geocoder
+#                        does NOT understand ZIP codes, hence the separate lookup.
+#   2. LOCATION_CITY   - a place name geocoded via Open-Meteo. Add a region hint
+#                        after a comma to disambiguate, e.g. 'Santa Clara, CA'.
+#   3. USE_IP_LOCATION - public-IP geolocation (ip-api.com). Follows the Pi to a
+#                        new network automatically, but a VPN or unusual ISP
+#                        routing can place you in the wrong city.
+#   4. LOCATION_LAT/LON - hardcoded fallback, used only if all the above are off
+#                        or fail (no internet yet, API down).
+#
+# Currently PINNED to ZIP an unset ZIP. To make the weather follow the
+# Pi automatically instead, set LOCATION_ZIP = '' and USE_IP_LOCATION = True.
+LOCATION_ZIP = '00000'
+LOCATION_ZIP_COUNTRY = 'us'
+LOCATION_CITY = ''
+USE_IP_LOCATION = False
+LOCATION_LAT = 51.4779   # 00000 fallback, used only if the ZIP lookup is down
+LOCATION_LON = -0.0015
+LOCATION_LABEL = 'Greenwich'
+
+PRINTER_CONF = {
+    'IP': '10.0.0.x',
+    'SERIAL': 'your-bambu-serial',
+    'ACCESS_CODE': 'your-lan-access-code'
+}
+
+ROBOROCK_CONF = {
+    'EMAIL': 'email...'
+}
+
+LASTFM_CONF = {
+    'API_KEY': '',
+    'USERNAME': ''
+}
+
+STRAVA_CONF = {
+    'TOKEN_FILE': os.path.join(BASE_DIR, 'strava_token.json')
+}
+
+# --- FILES & SCOPES ---
+GMAIL_TOKEN_PATH = os.path.join(BASE_DIR, 'token.json')
+ROBOROCK_TOKEN_FILE = os.path.join(BASE_DIR, 'roborock_session.pkl')
+ROBOROCK_STATS_FILE = os.path.join(BASE_DIR, 'roborock_stats.json')
+GMAIL_SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+
+if os.path.exists(LIB_DIR):
+    sys.path.append(LIB_DIR)
+
+import display as display_backend
+import wifi_setup
+import settings as settings_ui
+import bluetooth_music
+
+try:
+    import bambulabs_api as bl
+    from roborock.web_api import RoborockApiClient
+    from roborock.devices.device_manager import create_device_manager, UserParams
+except ImportError:
+    pass
+
+# --- LOGGING ---
+logging.getLogger("bambulabs_api").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+logging.getLogger("roborock").setLevel(logging.CRITICAL)
+logging.getLogger("aiomqtt").setLevel(logging.CRITICAL)
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+file_handler = RotatingFileHandler(LOG_FILE, maxBytes=1 * 1024 * 1024, backupCount=1)
+file_handler.setFormatter(formatter)
+
+logger.handlers.clear()
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
+
+icon_cache = {}
+global_printer = None
+bt = None  # bluetooth_music.BtMusic instance (created in main())
+
+
+# ##############
+# --- THEME ---
+# ##############
+# The e-paper panel was 1-bit, so everything was black-on-white. The LCD is
+# full colour: text/graph colours come from THEME so the palette can be swapped
+# at runtime (long-press the screen).
+DARK_THEME = {
+    'bg': (11, 13, 17),
+    'fg': (233, 237, 243),
+    'muted': (146, 155, 170),
+    'line': (44, 50, 61),
+    'accent': (64, 196, 255),
+    'warn': (255, 183, 77),
+    'alert': (255, 95, 95),
+    'ok': (94, 222, 142),
+    'gold': (240, 200, 90),
+}
+
+LIGHT_THEME = {
+    'bg': (250, 250, 248),
+    'fg': (20, 22, 26),
+    'muted': (110, 116, 126),
+    'line': (208, 212, 219),
+    'accent': (0, 122, 204),
+    'warn': (198, 118, 0),
+    'alert': (198, 40, 40),
+    'ok': (22, 140, 72),
+    'gold': (176, 132, 0),
+}
+
+THEME = dict(DARK_THEME)
+THEME_NAME = 'dark'
+
+
+def toggle_theme():
+    global THEME_NAME
+    THEME_NAME = 'light' if THEME_NAME == 'dark' else 'dark'
+    THEME.clear()
+    THEME.update(LIGHT_THEME if THEME_NAME == 'light' else DARK_THEME)
+    logging.info(f"Theme -> {THEME_NAME}")
+
+
+def pct_color(pct):
+    if pct >= 90:
+        return THEME['alert']
+    if pct >= 75:
+        return THEME['warn']
+    return THEME['accent']
+
+
+# --- ROBUST NETWORK MANAGER ---
+class NetworkManager:
+    def __init__(self):
+        self.session = None
+        self.create_session()
+
+    def create_session(self):
+        if self.session:
+            try:
+                self.session.close()
+            except:
+                pass
+        gc.collect()
+        self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=5, pool_maxsize=10,
+            max_retries=requests.adapters.Retry(total=1, backoff_factor=0.5)
+        )
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+
+    def get_json(self, url, headers=None, data=None, method='GET', timeout=10):
+        try:
+            if self.session is None: self.create_session()
+            if method == 'POST':
+                resp = self.session.post(url, headers=headers, data=data, timeout=timeout)
+            else:
+                resp = self.session.get(url, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            self.create_session()
+            return None
+
+    def get_image(self, url, timeout=15):
+        try:
+            if self.session is None: self.create_session()
+            resp = self.session.get(url, timeout=timeout)
+            resp.raise_for_status()
+            return resp.content
+        except Exception as e:
+            self.create_session()
+            return None
+
+
+net = NetworkManager()
+
+
+# --- GLOBAL DATA STORE ---
+class DataStore:
+    def __init__(self):
+        # RLock so bump() can be called from inside a `with data_store.lock` block.
+        self.lock = threading.RLock()
+        self.rev = 0
+        self.updated_at = 0
+        self.weather = {}
+        self.aqi = 0
+        # Resolved weather location. Seeded from the configured fallback and
+        # overwritten once IP geolocation succeeds (if USE_IP_LOCATION).
+        self.location = {'lat': LOCATION_LAT, 'lon': LOCATION_LON, 'label': LOCATION_LABEL}
+        self.strava = {
+            'rides': 0, 'total_distance': 0,
+            'rides_curr': 0, 'distance_curr': 0,
+            'rides_prev': 0, 'distance_prev': 0,
+            'bike_total': 0, 'hike_total': 0
+        }
+        self.printer = {'status': 'OFFLINE'}
+        self.gmail_unread = 0
+        self.spotify = {'status': 'PAUSED', 'text': '', 'cover': None}
+        self.claude = {'error': False, 'five_hour': {}, 'seven_day': {}}
+        self.antigravity = {'error': False, 'models': []}
+        self.roborock = {
+            'status': 'OFFLINE', 'battery': 0, 'is_cleaning': False,
+            'current_area': 0.0, 'ref_area': 0.0, 'pct': 0.0, 'last_date': '-'
+        }
+        self.sysload = {'cpu': 0, 'ram_free': 0, 'history': deque(maxlen=30)}
+        # Markets shown in the finance widget: each value is {'price', 'pct'}.
+        self.market = {'btc': {}, 'sp500': {}, 'gold': {}}
+        self.ping = {'current': 0, 'history': deque(maxlen=50)}
+
+        self.last_update = {
+            'weather': 0, 'strava': 0, 'printer': 0, 'gmail': 0,
+            'spotify': 0, 'market': 0, 'sysload': 0, 'ping': 0,
+            'claude': 0, 'antigravity': 0, 'geo': 0
+        }
+
+    def bump(self):
+        """Mark data as changed so the render loop knows to redraw."""
+        with self.lock:
+            self.rev += 1
+            self.updated_at = time.time()
+
+    def force_refresh(self):
+        with self.lock:
+            for key in self.last_update:
+                self.last_update[key] = 0
+
+
+data_store = DataStore()
+
+
+# --- HELPERS ---
+def ping_printer(ip):
+    try:
+        result = subprocess.run(
+            ['ping', '-c', '1', '-W', '1', ip],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        return result.returncode == 0
+    except:
+        return False
+
+
+_local_ip_cache = {'ip': '-', 'ts': 0}
+
+
+def get_local_ip():
+    if time.time() - _local_ip_cache['ts'] < 300:
+        return _local_ip_cache['ip']
+    ip = '-'
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(1)
+            s.connect(('8.8.8.8', 80))
+            ip = s.getsockname()[0]
+    except Exception:
+        pass
+    _local_ip_cache.update({'ip': ip, 'ts': time.time()})
+    return ip
+
+
+def geolocate_by_ip():
+    """Resolve (lat, lon, label) from the public IP, or None on failure.
+
+    Uses ip-api.com (free, no key, HTTP-only on the free tier, ~45 req/min).
+    We query it at most a few times a day, so the rate limit is irrelevant.
+    """
+    data = net.get_json(API_ENDPOINTS['geo_ip'], timeout=8)
+    if not data or data.get('status') != 'success':
+        return None
+    try:
+        lat = float(data['lat'])
+        lon = float(data['lon'])
+    except (KeyError, TypeError, ValueError):
+        return None
+    parts = [p for p in (data.get('city'), data.get('regionName')) if p]
+    label = ', '.join(parts) or data.get('countryCode') or 'Unknown'
+    return lat, lon, label
+
+
+# US state abbreviations, so a hint like "CA" in LOCATION_CITY disambiguates to
+# California rather than matching some other place's substring.
+_US_STATES = {
+    'AL': 'Alabama', 'AK': 'Alaska', 'AZ': 'Arizona', 'AR': 'Arkansas',
+    'CA': 'California', 'CO': 'Colorado', 'CT': 'Connecticut', 'DE': 'Delaware',
+    'FL': 'Florida', 'GA': 'Georgia', 'HI': 'Hawaii', 'ID': 'Idaho',
+    'IL': 'Illinois', 'IN': 'Indiana', 'IA': 'Iowa', 'KS': 'Kansas',
+    'KY': 'Kentucky', 'LA': 'Louisiana', 'ME': 'Maine', 'MD': 'Maryland',
+    'MA': 'Massachusetts', 'MI': 'Michigan', 'MN': 'Minnesota', 'MS': 'Mississippi',
+    'MO': 'Missouri', 'MT': 'Montana', 'NE': 'Nebraska', 'NV': 'Nevada',
+    'NH': 'New Hampshire', 'NJ': 'New Jersey', 'NM': 'New Mexico', 'NY': 'New York',
+    'NC': 'North Carolina', 'ND': 'North Dakota', 'OH': 'Ohio', 'OK': 'Oklahoma',
+    'OR': 'Oregon', 'PA': 'Pennsylvania', 'RI': 'Rhode Island', 'SC': 'South Carolina',
+    'SD': 'South Dakota', 'TN': 'Tennessee', 'TX': 'Texas', 'UT': 'Utah',
+    'VT': 'Vermont', 'VA': 'Virginia', 'WA': 'Washington', 'WV': 'West Virginia',
+    'WI': 'Wisconsin', 'WY': 'Wyoming', 'DC': 'District of Columbia',
+}
+
+
+def _pick_geocode(results, hint):
+    """Choose the geocoding result best matching the region/country hint."""
+    if not hint:
+        return results[0]
+    h = hint.lower()
+    state = _US_STATES.get(hint.upper(), '').lower()
+
+    def score(r):
+        admin1 = (r.get('admin1') or '').lower()
+        cc = (r.get('country_code') or '').lower()
+        country = (r.get('country') or '').lower()
+        s = 0
+        if state and admin1 == state:
+            s += 5
+        if h == admin1:
+            s += 4
+        if h == cc:
+            s += 3
+        if h == country:
+            s += 3
+        return s
+
+    # Open-Meteo returns results ranked by population/relevance; max() keeps the
+    # first (highest-ranked) on a score tie.
+    return max(results, key=score)
+
+
+def geocode_city(query):
+    """Resolve a place name like 'Santa Clara, CA' to (lat, lon, label).
+
+    Uses Open-Meteo's geocoding API (free, no key). The part before the first
+    comma is the city; anything after is a region/country hint used to pick the
+    right match when the name is ambiguous. Returns None on failure.
+    """
+    query = (query or '').strip()
+    if not query:
+        return None
+    name, _, hint = query.partition(',')
+    name, hint = name.strip(), hint.strip()
+
+    url = (f"{API_ENDPOINTS['geo_city']}?name={urllib.parse.quote(name)}"
+           f"&count=10&language=en&format=json")
+    data = net.get_json(url, timeout=8)
+    results = (data or {}).get('results') or []
+    if not results:
+        return None
+
+    best = _pick_geocode(results, hint)
+    try:
+        lat = float(best['latitude'])
+        lon = float(best['longitude'])
+    except (KeyError, TypeError, ValueError):
+        return None
+    label = ', '.join(p for p in (best.get('name'), best.get('admin1')) if p) or name
+    return lat, lon, label
+
+
+def geocode_zip(zipcode, country='us'):
+    """Resolve a postal code to (lat, lon, label) via zippopotam.us (free, no key).
+
+    Open-Meteo's geocoder ignores ZIP codes, so this is the only way to pin a
+    specific postal area rather than a whole city. Returns None on failure.
+    """
+    zipcode = (zipcode or '').strip()
+    if not zipcode:
+        return None
+    url = f"{API_ENDPOINTS['geo_zip']}/{country}/{urllib.parse.quote(zipcode)}"
+    data = net.get_json(url, timeout=8)
+    places = (data or {}).get('places') or []
+    if not places:
+        return None
+    p = places[0]
+    try:
+        lat = float(p['latitude'])
+        lon = float(p['longitude'])
+    except (KeyError, TypeError, ValueError):
+        return None
+    label = p.get('place name') or zipcode
+    return lat, lon, label
+
+
+# --- RUNTIME SETTINGS (on-screen editable, persisted to settings.json) ---
+def load_runtime_settings():
+    """Apply any settings saved from the on-screen menu over the code defaults."""
+    global LOCATION_ZIP
+    try:
+        with open(SETTINGS_FILE) as f:
+            s = json.load(f)
+        z = s.get('zip')
+        if isinstance(z, str) and z.strip():
+            LOCATION_ZIP = z.strip()
+            logging.info(f"Loaded ZIP from settings: {LOCATION_ZIP}")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logging.error(f"Failed to read settings.json: {e}")
+
+
+def apply_zip(new_zip):
+    """Set the weather ZIP from the on-screen menu, persist it, and re-resolve."""
+    global LOCATION_ZIP
+    LOCATION_ZIP = str(new_zip).strip()
+    try:
+        with open(SETTINGS_FILE, 'w') as f:
+            json.dump({'zip': LOCATION_ZIP}, f)
+    except Exception as e:
+        logging.error(f"Failed to write settings.json: {e}")
+    with data_store.lock:
+        data_store.last_update['geo'] = 0      # force location re-resolve
+        data_store.last_update['weather'] = 0  # and an immediate weather refetch
+    logging.info(f"ZIP set to {LOCATION_ZIP}")
+
+
+def fetch_claude_profile():
+    """{'name','email','plan'} for the connected Claude account, or None."""
+    try:
+        import claude
+        return claude.fetch_profile()
+    except Exception:
+        return None
+
+
+def build_settings_ctx():
+    """Hooks the on-screen settings menu uses to read/change dashboard state."""
+    return {
+        'current_zip': lambda: LOCATION_ZIP,
+        'apply_zip': apply_zip,
+        'app_version': APP_VERSION,
+        'fetch_claude': fetch_claude_profile,
+        'fetch_google': fetch_google_email,
+        'current_ssid': wifi_setup.current_ssid,
+        'bt': lambda: bt,   # deferred: the BtMusic instance (created in start_threads)
+    }
+
+
+def fetch_google_email():
+    """Email of the connected Gmail account, or None. For the Account screen."""
+    if not GMAIL_AVAILABLE or not os.path.exists(GMAIL_TOKEN_PATH):
+        return None
+    try:
+        creds = Credentials.from_authorized_user_file(GMAIL_TOKEN_PATH, GMAIL_SCOPES)
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        if not creds or not creds.valid:
+            return None
+        service = build('gmail', 'v1', credentials=creds, cache_discovery=False)
+        return service.users().getProfile(userId='me').execute().get('emailAddress')
+    except Exception:
+        return None
+
+
+def _has_light_background(gray):
+    """True if the icon is a dark shape on a light field (the common case)."""
+    w, h = gray.size
+    corners = (gray.getpixel((0, 0)), gray.getpixel((w - 1, 0)),
+               gray.getpixel((0, h - 1)), gray.getpixel((w - 1, h - 1)))
+    return sum(corners) / 4.0 >= 128
+
+
+def get_cached_icon(name, size):
+    """Return the icon as an 'L' alpha mask so it can be painted in any colour.
+
+    Most source bitmaps are dark shapes on a light background, so they need
+    inverting to make the shape opaque and the background transparent. A few
+    (icon_wifi) ship the other way round; inverting those would paint the
+    background and knock the glyph out, so detect polarity per icon.
+    """
+    key = f"{name}_{size[0]}x{size[1]}"
+    if key not in icon_cache:
+        path = os.path.join(ICON_DIR, f"{name}.bmp")
+        if os.path.exists(path):
+            try:
+                with Image.open(path) as f_img:
+                    mask = f_img.convert("L").resize(size, Image.LANCZOS)
+                    if _has_light_background(mask):
+                        mask = ImageOps.invert(mask)
+                    icon_cache[key] = mask
+            except Exception:
+                icon_cache[key] = None
+        else:
+            icon_cache[key] = None
+    return icon_cache.get(key)
+
+
+def time_until(iso_str):
+    if not iso_str: return "N/A"
+    try:
+        # Handling the explicit +00:00 timezone format
+        target = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+        now = datetime.now(timezone.utc)
+        diff = target - now
+        if diff.total_seconds() < 0: return "Resetting..."
+        hours, rem = divmod(diff.total_seconds(), 3600)
+        days, hours = divmod(hours, 24)
+        if days > 0:
+            return f"{int(days)}d {int(hours)}h"
+        else:
+            minutes = rem // 60
+            return f"{int(hours)}h {int(minutes)}m"
+    except Exception:
+        return "N/A"
+
+
+# --- AUTH & FETCH THREADS ---
+
+def auth_claude():
+    global ENABLE_CLAUDE
+    if not ENABLE_CLAUDE: return
+    try:
+        import claude
+        success = claude.interactive_auth()
+        if not success:
+            ENABLE_CLAUDE = False
+            print("Claude widget is disabled.")
+    except ImportError:
+        print("claude.py not found. Claude widget disabled.")
+        ENABLE_CLAUDE = False
+
+
+def auth_antigravity():
+    global ENABLE_ANTIGRAVITY
+    if not ENABLE_ANTIGRAVITY: return
+    try:
+        import antigravity
+        success = antigravity.interactive_auth()
+        if not success:
+            ENABLE_ANTIGRAVITY = False
+            print("Antigravity widget is disabled.")
+    except ImportError:
+        print("antigravity.py not found. Antigravity widget disabled.")
+        ENABLE_ANTIGRAVITY = False
+
+
+def auth_strava():
+    global ENABLE_STRAVA
+    if not ENABLE_STRAVA: return
+
+    if os.path.exists(STRAVA_CONF['TOKEN_FILE']):
+        return
+
+    print("\n--- STRAVA CONFIGURATION REQUIRED ---")
+    c_id = input("Enter Strava Client ID (or press Enter to disable): ").strip()
+    if not c_id:
+        print("Strava is disabled. Fallback widget (System Load) will be used.\n")
+        ENABLE_STRAVA = False
+        return
+
+    c_secret = input("Enter Strava Client Secret: ").strip()
+
+    auth_url = (
+        f"{API_ENDPOINTS['strava_auth']}?"
+        f"client_id={c_id}&"
+        f"response_type=code&"
+        f"redirect_uri=http://localhost&"
+        f"approval_prompt=force&"
+        f"scope=activity:read_all"
+    )
+
+    print("\n[!] To get a token with the correct permissions, open this link in your browser:\n")
+    print(f"--> {auth_url} <--\n")
+    print("Click 'Authorize'. You will be redirected to an empty/error page (localhost).")
+    print("Look at the address bar. Copy the 'code' parameter.")
+
+    code_input = input("Enter the 'code' from the URL (or paste the full URL): ").strip()
+
+    if not code_input:
+        print("Authorization cancelled. Strava is disabled.\n")
+        ENABLE_STRAVA = False
+        return
+
+    if 'code=' in code_input:
+        try:
+            parsed = urllib.parse.urlparse(code_input)
+            params = urllib.parse.parse_qs(parsed.query)
+            code = params.get('code', [code_input])[0]
+        except:
+            code = code_input.split('code=')[1].split('&')[0]
+    else:
+        code = code_input
+
+    print("Fetching Access Token...")
+    data = {'client_id': c_id, 'client_secret': c_secret, 'code': code, 'grant_type': 'authorization_code'}
+
+    try:
+        resp = requests.post(API_ENDPOINTS['strava_token'], data=data)
+        resp.raise_for_status()
+        token_data = resp.json()
+        token_data['client_id'] = c_id
+        token_data['client_secret'] = c_secret
+
+        with open(STRAVA_CONF['TOKEN_FILE'], 'w') as f:
+            json.dump(token_data, f, indent=4)
+        print("Strava Authorization Successful!\n")
+    except Exception as e:
+        print(f"Failed to fetch Strava tokens: {e}")
+        ENABLE_STRAVA = False
+
+
+def fetch_strava_data():
+    if not os.path.exists(STRAVA_CONF['TOKEN_FILE']): return None
+    with open(STRAVA_CONF['TOKEN_FILE'], 'r') as f:
+        token_data = json.load(f)
+
+    c_id = token_data.get('client_id')
+    c_secret = token_data.get('client_secret')
+
+    if time.time() > token_data.get('expires_at', 0):
+        data = {'client_id': c_id, 'client_secret': c_secret, 'grant_type': 'refresh_token',
+                'refresh_token': token_data.get('refresh_token')}
+        new_token = net.get_json(API_ENDPOINTS['strava_token'], data=data, method='POST')
+        if new_token and 'access_token' in new_token:
+            new_token['client_id'] = c_id
+            new_token['client_secret'] = c_secret
+            token_data = new_token
+            with open(STRAVA_CONF['TOKEN_FILE'], 'w') as f:
+                json.dump(token_data, f, indent=4)
+        else:
+            return None
+
+    access_token = token_data['access_token']
+
+    now_year = datetime.now().year
+    start_curr_ts = datetime(now_year, 1, 1).timestamp()
+    start_prev_ts = datetime(now_year - 1, 1, 1).timestamp()
+    end_prev_ts = datetime(now_year - 1, 12, 31, 23, 59, 59).timestamp()
+
+    page = 1
+    total_rides, total_dist = 0, 0
+    rides_curr, dist_curr = 0, 0
+    rides_prev, dist_prev = 0, 0
+    bike_total, hike_total = 0, 0
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    while True:
+        url = f"{API_ENDPOINTS['strava_activities']}?page={page}&per_page=100"
+        activities = net.get_json(url, headers=headers)
+        if not activities: break
+
+        for act in activities:
+            t = act.get('type')
+            d = act.get('distance', 0)
+            act_time = datetime.strptime(act['start_date'], "%Y-%m-%dT%H:%M:%SZ").timestamp()
+
+            if t in ['Ride', 'VirtualRide', 'EBikeRide', 'GravelRide', 'MountainBikeRide']:
+                total_rides += 1
+                total_dist += d
+                bike_total += d
+                if act_time >= start_curr_ts:
+                    rides_curr += 1
+                    dist_curr += d
+                elif start_prev_ts <= act_time <= end_prev_ts:
+                    rides_prev += 1
+                    dist_prev += d
+            elif t in ['Hike', 'Walk']:
+                hike_total += d
+
+        if len(activities) < 100: break
+        page += 1
+
+    return {
+        "rides": total_rides,
+        "total_distance": round(total_dist / 1000, 1),
+        "rides_curr": rides_curr,
+        "distance_curr": round(dist_curr / 1000, 1),
+        "rides_prev": rides_prev,
+        "distance_prev": round(dist_prev / 1000, 1),
+        "bike_total": round(bike_total / 1000, 1),
+        "hike_total": round(hike_total / 1000, 1)
+    }
+
+
+def auth_roborock(email):
+    global ENABLE_ROBOROCK
+    if not ENABLE_ROBOROCK: return None
+
+    if os.path.exists(ROBOROCK_TOKEN_FILE):
+        try:
+            with open(ROBOROCK_TOKEN_FILE, "rb") as f:
+                return pickle.load(f)
+        except:
+            pass
+
+    print("\n--- ROBOROCK AUTHORIZATION REQUIRED ---")
+
+    async def _do_auth():
+        web_api = RoborockApiClient(username=email)
+        await web_api.request_code()
+        code = input(f"Enter 6-digit Roborock auth code sent to {email} (or press Enter to disable): ").strip()
+        if not code: return None
+        user_data = await web_api.code_login(code)
+        with open(ROBOROCK_TOKEN_FILE, "wb") as f: pickle.dump(user_data, f)
+        print("Roborock Authorization Successful!\n")
+        return user_data
+
+    if sys.platform == "win32": asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    try:
+        user_data = asyncio.run(_do_auth())
+        if not user_data:
+            print("Roborock is disabled. Fallback widget (Ping) will be used.\n")
+            ENABLE_ROBOROCK = False
+        return user_data
+    except Exception as e:
+        print(f"Failed to auth Roborock: {e}")
+        ENABLE_ROBOROCK = False
+        return None
+
+
+def roborock_update_thread(user_data, email):
+    if not ENABLE_ROBOROCK or not user_data: return
+
+    async def _loop():
+        ref_area, last_date = 0.0, "-"
+        if os.path.exists(ROBOROCK_STATS_FILE):
+            try:
+                with open(ROBOROCK_STATS_FILE, "r") as f:
+                    stats = json.load(f)
+                    ref_area, last_date = stats.get("ref_area", 0.0), stats.get("last_date", "-")
+            except:
+                pass
+
+        user_params = UserParams(username=email, user_data=user_data)
+        device_manager = await create_device_manager(user_params)
+
+        short_states = {
+            5: "Clean", 6: "Return", 8: "Charge", 10: "Pause",
+            17: "Spot", 18: "Room", 22: "Empty", 23: "Wash",
+            26: "ToWash", 29: "Map"
+        }
+
+        while True:
+            try:
+                devices = await device_manager.get_devices()
+                if devices and devices[0].v1_properties:
+                    device = devices[0]
+                    status_trait = device.v1_properties.status
+                    await status_trait.refresh()
+                    current_area = (status_trait.clean_area / 1000000) if status_trait.clean_area else 0
+
+                    is_cleaning = status_trait.state in [5, 6, 10, 17, 18, 22, 23, 26, 29]
+                    status_str = short_states.get(status_trait.state, f"S:{status_trait.state}")
+
+                    if not is_cleaning and current_area > 0 and current_area != ref_area:
+                        ref_area = current_area
+                        last_date = datetime.now().strftime("%d %b %H:%M")
+                        with open(ROBOROCK_STATS_FILE, "w") as f: json.dump(
+                            {"ref_area": ref_area, "last_date": last_date}, f)
+
+                    pct = (current_area / ref_area) * 100 if is_cleaning and ref_area > 0 else 0.0
+
+                    with data_store.lock:
+                        data_store.roborock = {
+                            'status': status_str, 'battery': status_trait.battery,
+                            'is_cleaning': is_cleaning, 'current_area': current_area,
+                            'ref_area': ref_area, 'pct': pct, 'last_date': last_date
+                        }
+                        data_store.bump()
+            except Exception as e:
+                logging.error(f"Roborock error: {e}")
+            await asyncio.sleep(60)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(_loop())
+
+
+def update_data_thread():
+    global global_printer
+
+    if ENABLE_BAMBU:
+        try:
+            global_printer = bl.Printer(PRINTER_CONF['IP'], PRINTER_CONF['ACCESS_CODE'], PRINTER_CONF['SERIAL'])
+        except Exception as e:
+            logging.error(f"Bambu init error: {e}")
+            global_printer = None
+
+    is_connected = False
+
+    while True:
+        now = time.time()
+
+        # Resolve the weather location before the weather fetch, so the first
+        # pass resolves the location and then fetches for that spot; re-checked
+        # once a day. Priority: ZIP -> city name -> public IP -> lat/lon fallback.
+        # A failure leaves the previous location in place, so a brief outage or a
+        # bad lookup never blanks the weather.
+        if now - data_store.last_update['geo'] > 86400:
+            geo = geocode_zip(LOCATION_ZIP, LOCATION_ZIP_COUNTRY) if LOCATION_ZIP else None
+            if not geo and LOCATION_CITY:
+                geo = geocode_city(LOCATION_CITY)
+            if not geo and USE_IP_LOCATION:
+                geo = geolocate_by_ip()
+            if geo:
+                lat, lon, label = geo
+                with data_store.lock:
+                    moved = (lat, lon) != (data_store.location['lat'], data_store.location['lon'])
+                    data_store.location = {'lat': lat, 'lon': lon, 'label': label}
+                # Force an immediate weather refresh when the location changes.
+                if moved:
+                    logging.info(f"Weather location: {label} ({lat:.3f}, {lon:.3f})")
+                    data_store.last_update['weather'] = 0
+                data_store.last_update['geo'] = now
+            else:
+                # Nothing resolved yet - retry in ~10 min rather than a full day.
+                data_store.last_update['geo'] = now - 86400 + 600
+
+        if now - data_store.last_update['weather'] > 600:
+            loc = data_store.location
+            lat, lon = loc['lat'], loc['lon']
+            weather_url = f"{API_ENDPOINTS['weather']}?latitude={lat}&longitude={lon}&current=temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m,wind_direction_10m,weather_code,is_day,uv_index&hourly=temperature_2m,precipitation_probability,weather_code,cloud_cover&timezone=auto&forecast_days=2"
+            aqi_url = f"{API_ENDPOINTS['aqi']}?latitude={lat}&longitude={lon}&current=european_aqi&timezone=auto"
+            w_data = net.get_json(weather_url)
+            a_data = net.get_json(aqi_url)
+            with data_store.lock:
+                if w_data: data_store.weather = w_data
+                if a_data and 'current' in a_data: data_store.aqi = a_data['current'].get('european_aqi', 0)
+                data_store.bump()
+            data_store.last_update['weather'] = now
+
+        if ENABLE_STRAVA:
+            if now - data_store.last_update['strava'] > 900:
+                s_data = fetch_strava_data()
+                if s_data:
+                    with data_store.lock:
+                        data_store.strava = s_data
+                        data_store.bump()
+                data_store.last_update['strava'] = now
+        else:
+            if now - data_store.last_update['sysload'] > 30:
+                try:
+                    with open('/proc/loadavg', 'r') as f:
+                        cpu = float(f.read().split()[0]) * 10
+                    with open('/proc/meminfo', 'r') as f:
+                        lines = f.readlines()
+                        free = int(lines[1].split()[1]) // 1024
+                    with data_store.lock:
+                        data_store.sysload['cpu'] = min(int(cpu), 100)
+                        data_store.sysload['ram_free'] = free
+                        data_store.sysload['history'].append(min(int(cpu), 100))
+                        data_store.bump()
+                except:
+                    pass
+                data_store.last_update['sysload'] = now
+
+        if ENABLE_BAMBU:
+            update_interval = 5 if is_connected else 15
+            if now - data_store.last_update['printer'] > update_interval:
+                is_alive = ping_printer(PRINTER_CONF['IP'])
+                if is_alive:
+                    try:
+                        if not is_connected and global_printer:
+                            global_printer.connect()
+                            time.sleep(1)
+                            is_connected = True
+                        if global_printer:
+                            # An idle printer reports UNKNOWN gcode state but still
+                            # pushes temps over MQTT, so treat reachable+UNKNOWN as
+                            # IDLE rather than dropping it to OFFLINE.
+                            raw = global_printer.get_state()
+                            state = str(raw).upper() if raw else 'IDLE'
+                            if state in ('UNKNOWN', 'NONE', ''):
+                                state = 'IDLE'
+                            try:
+                                nozzle = global_printer.get_nozzle_temperature()
+                                bed = global_printer.get_bed_temperature()
+                            except Exception:
+                                nozzle = bed = None
+                            with data_store.lock:
+                                data_store.printer = {
+                                    'status': state,
+                                    'percentage': global_printer.get_percentage(),
+                                    'remaining_time': global_printer.get_time(),
+                                    'layers': f"{global_printer.current_layer_num()}/{global_printer.total_layer_num()}",
+                                    'nozzle': nozzle,
+                                    'bed': bed,
+                                }
+                                data_store.bump()
+                    except Exception as e:
+                        is_connected = False
+                        with data_store.lock:
+                            data_store.printer = {'status': 'OFFLINE'}
+                            data_store.bump()
+                        try:
+                            if global_printer: global_printer.disconnect()
+                        except:
+                            pass
+                else:
+                    if is_connected:
+                        is_connected = False
+                        try:
+                            global_printer.disconnect()
+                        except:
+                            pass
+                    with data_store.lock:
+                        data_store.printer = {'status': 'OFFLINE'}
+                        data_store.bump()
+                data_store.last_update['printer'] = now
+
+        # Markets (BTC / S&P 500 / gold) - always fetched; shown in column 1's
+        # lower slot regardless of the printer.
+        if now - data_store.last_update['market'] > 600:
+            m_data = fetch_markets()
+            if m_data:
+                with data_store.lock:
+                    data_store.market.update(m_data)
+                    data_store.bump()
+            data_store.last_update['market'] = now
+
+        if not ENABLE_ROBOROCK and not ENABLE_ANTIGRAVITY:
+            if now - data_store.last_update['ping'] > 20:
+                try:
+                    out = subprocess.check_output(['ping', '-c', '1', '-W', '1', '8.8.8.8']).decode('utf-8')
+                    ms = float(out.split('time=')[1].split(' ms')[0])
+                except:
+                    ms = 0
+                with data_store.lock:
+                    data_store.ping['current'] = int(ms)
+                    data_store.ping['history'].append(int(ms))
+                    data_store.bump()
+                data_store.last_update['ping'] = now
+
+        if GMAIL_AVAILABLE and now - data_store.last_update['gmail'] > 300:
+            try:
+                creds = None
+                if os.path.exists(GMAIL_TOKEN_PATH):
+                    creds = Credentials.from_authorized_user_file(GMAIL_TOKEN_PATH, GMAIL_SCOPES)
+                    if creds and creds.expired and creds.refresh_token:
+                        creds.refresh(Request())
+                        with open(GMAIL_TOKEN_PATH, 'w') as t: t.write(creds.to_json())
+                if creds and creds.valid:
+                    service = build('gmail', 'v1', credentials=creds, cache_discovery=False)
+                    label_info = service.users().labels().get(userId='me', id='INBOX').execute()
+                    with data_store.lock:
+                        data_store.gmail_unread = label_info.get('messagesUnread', 0)
+                        data_store.bump()
+            except:
+                pass
+            data_store.last_update['gmail'] = now
+
+        # Claude Data Fetching (Run external script every 10 min)
+        if ENABLE_CLAUDE and now - data_store.last_update['claude'] > 600:
+            try:
+                subprocess.run([sys.executable, os.path.join(BASE_DIR, 'claude.py')], capture_output=True, timeout=30)
+                usage_path = os.path.join(BASE_DIR, 'usage.json')
+                if os.path.exists(usage_path):
+                    with open(usage_path, 'r') as f:
+                        usage_data = json.load(f)
+                    with data_store.lock:
+                        data_store.claude = usage_data
+                        if "error" in usage_data and "five_hour" not in usage_data:
+                            data_store.claude['error'] = True
+                        else:
+                            data_store.claude['error'] = False
+                        data_store.bump()
+                else:
+                    with data_store.lock:
+                        data_store.claude['error'] = True
+                        data_store.bump()
+            except Exception as e:
+                logging.error(f"Claude update error: {e}")
+                with data_store.lock:
+                    data_store.claude['error'] = True
+                    data_store.bump()
+            data_store.last_update['claude'] = now
+
+        if ENABLE_ANTIGRAVITY and now - data_store.last_update['antigravity'] > 60:
+            try:
+                subprocess.run([sys.executable, os.path.join(BASE_DIR, 'antigravity.py')], capture_output=True, timeout=30)
+                limits_path = os.path.join(BASE_DIR, 'limits.json')
+                if os.path.exists(limits_path):
+                    with open(limits_path, 'r', encoding='utf-8') as f:
+                        limits_data = json.load(f)
+                    with data_store.lock:
+                        data_store.antigravity = limits_data
+                        if "error" in limits_data:
+                            data_store.antigravity['error'] = True
+                        else:
+                            data_store.antigravity['error'] = False
+                        data_store.bump()
+                else:
+                    with data_store.lock:
+                        data_store.antigravity['error'] = True
+                        data_store.bump()
+            except Exception as e:
+                logging.error(f"Antigravity update error: {e}")
+                with data_store.lock:
+                    data_store.antigravity['error'] = True
+                    data_store.bump()
+            data_store.last_update['antigravity'] = now
+
+        if ENABLE_SPOTIFY and now - data_store.last_update['spotify'] > 20:
+            url = f"{API_ENDPOINTS['lastfm']}?method=user.getrecenttracks&user={LASTFM_CONF['USERNAME']}&api_key={LASTFM_CONF['API_KEY']}&format=json&limit=2&rnd={int(now)}"
+            s_data = net.get_json(url, timeout=5)
+            if s_data:
+                try:
+                    tracks = s_data.get('recenttracks', {}).get('track', [])
+                    if isinstance(tracks, dict): tracks = [tracks]
+                    if tracks:
+                        current_track = tracks[0]
+                        is_playing = current_track.get('@attr', {}).get('nowplaying') == 'true'
+                        if is_playing:
+                            track_name = current_track.get('name', 'Unknown')
+                            artist = current_track.get('artist', {}).get('#text', 'Unknown')
+                            img_url = ""
+                            for img in current_track.get('image', []):
+                                if img.get('size') == 'extralarge': img_url = img.get('#text', '')
+                            # The LCD is full colour, so album art is kept as RGB
+                            # instead of the old 1-bit dither.
+                            cover = None
+                            if img_url:
+                                img_bytes = net.get_image(img_url)
+                                if img_bytes:
+                                    cover = Image.open(io.BytesIO(img_bytes)).convert("RGB").resize(
+                                        (COVER_SIZE, COVER_SIZE), Image.LANCZOS)
+                            with data_store.lock:
+                                data_store.spotify = {'status': 'PLAYING', 'text': f"{artist} - {track_name}",
+                                                      'cover': cover}
+                                data_store.bump()
+                        else:
+                            with data_store.lock:
+                                data_store.spotify = {'status': 'PAUSED', 'text': '', 'cover': None}
+                                data_store.bump()
+                except:
+                    pass
+            data_store.last_update['spotify'] = now
+
+        gc.collect()
+        time.sleep(1)
+
+
+# Finance widget symbols (Yahoo Finance chart API). GC=F is COMEX gold futures
+# in USD/oz; ^GSPC is the S&P 500 index; BTC-USD is bitcoin. Yahoo needs a
+# browser-like User-Agent or it returns 429/empty.
+MARKET_SYMBOLS = [('btc', 'BTC-USD'), ('sp500', '^GSPC'), ('gold', 'GC=F')]
+_YAHOO_HEADERS = {'User-Agent': 'Mozilla/5.0 (X11; Linux aarch64)'}
+
+
+def fetch_markets():
+    """Fetch current price + daily % change for each market symbol.
+
+    Returns {'btc': {'price', 'pct'}, ...} for whatever resolved, or None.
+    """
+    out = {}
+    for key, sym in MARKET_SYMBOLS:
+        url = (f"{API_ENDPOINTS['yahoo_chart']}{urllib.parse.quote(sym)}"
+               f"?interval=1d&range=1d")
+        data = net.get_json(url, headers=_YAHOO_HEADERS)
+        try:
+            meta = data['chart']['result'][0]['meta']
+            price = meta.get('regularMarketPrice')
+            if price is None:
+                continue
+            prev = meta.get('chartPreviousClose') or meta.get('previousClose')
+            pct = ((price - prev) / prev * 100.0) if prev else None
+            out[key] = {'price': float(price), 'pct': pct}
+        except (KeyError, IndexError, TypeError):
+            continue
+    return out or None
+
+
+# ###########################
+# --- LAYOUT (1920 x 440) ---
+# ###########################
+PAD = 24
+COL_W = SCREEN_W // 4  # 480 - four columns instead of three; the panel is
+                       # 560px wider but 40px shorter than the old e-paper.
+COL_X = [0, COL_W, COL_W * 2, COL_W * 3]
+
+ROW1_Y = 16
+ROW_RULE_Y = 218
+ROW2_Y = 236
+BOTTOM_Y = 424
+
+COVER_SIZE = 120
+
+
+def inner_x(col):
+    return COL_X[col] + PAD
+
+
+def inner_right(col):
+    return COL_X[col] + COL_W - PAD
+
+
+# --- GRAPHICS FUNCTIONS ---
+def draw_icon(img, x, y, name, size=(40, 40), color=None):
+    color = color or THEME['fg']
+    mask = get_cached_icon(name, size)
+    if mask:
+        img.paste(color, (int(x), int(y), int(x) + size[0], int(y) + size[1]), mask)
+    else:
+        ImageDraw.Draw(img).rectangle((x, y, x + size[0], y + size[1]), outline=THEME['line'])
+
+
+def text_size(draw, text, font):
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+
+def draw_text_right(draw, right_x, y, text, font, color):
+    """Align the glyphs' right ink edge to right_x (bbox[2] includes bearing)."""
+    bbox = draw.textbbox((0, 0), text, font=font)
+    draw.text((right_x - bbox[2], y), text, font=font, fill=color)
+
+
+def draw_text_center(draw, center_x, y, text, font, color):
+    bbox = draw.textbbox((0, 0), text, font=font)
+    draw.text((center_x - (bbox[0] + bbox[2]) / 2, y), text, font=font, fill=color)
+
+
+def hline(draw, x0, x1, y):
+    draw.line((x0, y, x1, y), fill=THEME['line'], width=2)
+
+
+def draw_bar(draw, x, y, w, h, pct, color=None):
+    """Rounded-ish progress bar. `pct` is 0-100."""
+    fill = color or pct_color(pct)
+    draw.rectangle((x, y, x + w, y + h), outline=THEME['line'], width=2)
+    fill_w = int((w - 4) * min(max(pct, 0) / 100.0, 1.0))
+    if fill_w > 0:
+        draw.rectangle((x + 2, y + 2, x + 2 + fill_w, y + h - 2), fill=fill)
+
+
+def draw_badge(draw, x, y, text, font, bg_color):
+    """Filled pill used to call out an alerting value (high AQI / UV).
+
+    Measures at the real draw origin so the fill hugs the glyphs regardless of
+    the font's ascender/bearing, rather than guessing with fixed offsets.
+    """
+    pad_x, pad_y = 14, 8
+    left, top, right, bottom = draw.textbbox((x, y), text, font=font)
+    draw.rectangle((left - pad_x, top - pad_y, right + pad_x, bottom + pad_y), fill=bg_color)
+    draw.text((x, y), text, font=font, fill=THEME['bg'])
+
+
+def draw_sparkline(draw, x, y, data, max_items=50, width=400, height=60,
+                   color=None, style="bar", zero_based=True):
+    if not data: return
+    color = color or THEME['accent']
+
+    lo = 0 if zero_based else min(data)
+    hi = max(data)
+    span = (hi - lo) or 1.0
+    step = width / max(max_items - 1, 1)
+
+    if style == "line":
+        points = []
+        for i, val in enumerate(data):
+            px = x + i * step
+            py = y + height - ((val - lo) / span) * height
+            points.append((px, py))
+        if len(points) > 1:
+            draw.line(points, fill=color, width=2, joint="curve")
+        # Faint baseline so a flat series still reads as a chart.
+        hline(draw, x, x + width, y + height)
+    else:
+        bar_w = max(int(step) - 1, 1)
+        for i, val in enumerate(data):
+            bh = int(((val - lo) / span) * height)
+            bx = x + i * step
+            by = y + height - bh
+            draw.rectangle((bx, by, bx + bar_w, y + height), fill=color)
+
+
+def get_weather_icon(code, is_day=1):
+    if code == 0:
+        return "icon_sun" if is_day else "icon_moon"
+    elif code in [1, 2]:
+        return "icon_partly-cloudy-day"
+    elif code == 3:
+        return "icon_clouds"
+    elif code in [45, 48]:
+        return "icon_wind"
+    elif code in [51, 53, 55, 61, 63, 65, 80, 81, 82]:
+        return "icon_rain"
+    elif code in [71, 73, 75, 85, 86]:
+        return "icon_snow"
+    elif code in [95, 96, 99]:
+        return "icon_cloud-lightning"
+    return "icon_sun"
+
+
+# --- WIDGETS ---
+def widget_strava(img, draw, x, y, strava):
+    draw_icon(img, x, y, "icon_strava", (56, 56), THEME['accent'])
+    draw.text((x + 70, y + 4), "STRAVA STATS", font=FONTS['28'], fill=THEME['fg'])
+
+    now_y = datetime.now().year
+    draw.text((x + 70, y + 44),
+              f"{now_y}: {strava.get('distance_curr', 0)} km | {now_y - 1}: {strava.get('distance_prev', 0)} km",
+              font=FONTS['20'], fill=THEME['muted'])
+    draw.text((x + 70, y + 70),
+              f"Total: {strava.get('total_distance', 0)} km | {strava.get('rides', 0)} acts",
+              font=FONTS['20'], fill=THEME['muted'])
+
+    draw_icon(img, x + 70, y + 100, "icon_bike", (28, 28), THEME['fg'])
+    draw.text((x + 104, y + 104), f"{strava.get('bike_total', 0)} km", font=FONTS['20'], fill=THEME['fg'])
+
+    draw_icon(img, x + 240, y + 100, "icon_hike", (28, 28), THEME['fg'])
+    draw.text((x + 274, y + 104), f"{strava.get('hike_total', 0)} km", font=FONTS['20'], fill=THEME['fg'])
+
+
+def widget_sysload(img, draw, x, y, sysload):
+    cpu = sysload['cpu']
+    draw_icon(img, x, y, "icon_cpu", (50, 50), pct_color(cpu))
+    draw.text((x + 64, y + 4), f"SYSTEM LOAD: {cpu}%", font=FONTS['28'], fill=THEME['fg'])
+    draw.text((x + 64, y + 42), f"RAM Free: {sysload['ram_free']} MB", font=FONTS['20'], fill=THEME['muted'])
+    draw_sparkline(draw, x + 64, y + 72, list(sysload['history']), max_items=30,
+                   width=360, height=70, color=pct_color(cpu), style="bar")
+
+
+def widget_bambu(img, draw, x, y, printer):
+    p_status = str(printer.get('status', 'OFFLINE')).upper()
+    offline = p_status in ("OFFLINE", "UNKNOWN")
+    printing = p_status in ("RUNNING", "PREPARE", "PAUSE", "SLICING")
+    icon_color = THEME['ok'] if printing else THEME['muted'] if offline else THEME['accent']
+    draw_icon(img, x, y, "icon_3d", (56, 56), icon_color)
+    draw.text((x + 70, y + 4), f"PRINTER: {p_status}", font=FONTS['28'], fill=THEME['fg'])
+
+    if printing:
+        percent = printer.get('percentage') or 0
+        draw_bar(draw, x + 70, y + 46, 340, 22, percent, THEME['ok'])
+        draw.text((x + 70, y + 78),
+                  f"{percent}% | Rem: {printer.get('remaining_time', '0')}m | {printer.get('layers', '0/0')} L",
+                  font=FONTS['20'], fill=THEME['muted'])
+    elif not offline:
+        # Idle / finished: show nozzle + bed temperatures instead of a progress bar.
+        nozzle, bed = printer.get('nozzle'), printer.get('bed')
+        if nozzle is not None:
+            draw_icon(img, x + 70, y + 48, "icon_temp", (26, 26), THEME['warn'])
+            draw.text((x + 104, y + 50), f"Nozzle {nozzle:.0f}°C", font=FONTS['20'], fill=THEME['muted'])
+        if bed is not None:
+            draw_icon(img, x + 250, y + 48, "icon_temp", (26, 26), THEME['accent'])
+            draw.text((x + 284, y + 50), f"Bed {bed:.0f}°C", font=FONTS['20'], fill=THEME['muted'])
+
+
+def widget_markets(img, draw, x, y, market):
+    # (key, label, colour, price prefix). S&P is an index, so no '$'.
+    rows = [
+        ('btc', 'BTC', THEME['warn'], '$'),
+        ('sp500', 'S&P 500', THEME['accent'], ''),
+        ('gold', 'GOLD', THEME['gold'], '$'),
+    ]
+    right = inner_right(0)
+    row_h = 62
+    for i, (key, label, color, prefix) in enumerate(rows):
+        ry = y + 4 + i * row_h
+        draw.text((x, ry), label, font=FONTS['32'], fill=color)
+
+        info = market.get(key) or {}
+        price = info.get('price')
+        if price is None:
+            draw.text((x + 175, ry + 2), "...", font=FONTS['32'], fill=THEME['muted'])
+            continue
+        price_str = f"{prefix}{price:,.0f}"
+        draw.text((x + 175, ry), price_str, font=FONTS['32'], fill=THEME['fg'])
+
+        pct = info.get('pct')
+        if pct is not None:
+            pc = THEME['ok'] if pct >= 0 else THEME['alert']
+            pct_str = f"{'+' if pct >= 0 else ''}{pct:.2f}%"
+            draw_text_right(draw, right, ry + 6, pct_str, FONTS['20'], pc)
+
+
+def widget_roborock(img, draw, x, y, rob):
+    battery = rob['battery']
+    draw_icon(img, x, y, "icon_roborock", (50, 50),
+              THEME['ok'] if battery > 25 else THEME['alert'])
+    draw.text((x + 64, y + 2), f"Bat: {battery}% | {rob['status']}", font=FONTS['28'], fill=THEME['fg'])
+
+    if rob['is_cleaning']:
+        draw.text((x + 64, y + 42), f"Clean: {rob['current_area']:.1f} m2 ({rob['pct']:.0f}%)",
+                  font=FONTS['24'], fill=THEME['muted'])
+        draw_bar(draw, x + 64, y + 78, 340, 22, min(rob['pct'], 100), THEME['accent'])
+    else:
+        draw.text((x + 64, y + 42), f"Last: {rob['last_date']} | {rob['ref_area']:.1f} m2",
+                  font=FONTS['24'], fill=THEME['muted'])
+
+
+def widget_antigravity(img, draw, x, y, antigravity):
+    draw_icon(img, x, y, "icon_cpu", (50, 50), THEME['accent'])
+    draw.text((x + 64, y + 2), "ANTIGRAVITY USAGE", font=FONTS['28'], fill=THEME['fg'])
+
+    if antigravity.get('error'):
+        draw.text((x + 64, y + 44), "Error loading data", font=FONTS['20'], fill=THEME['alert'])
+        return
+
+    models = antigravity.get('models', [])
+    opus = next((m for m in models if m.get('modelId') == 'claude-opus-4-6-thinking'), None)
+    gemini = next((m for m in models if m.get('modelId') == 'gemini-3-pro-high'), None)
+
+    y_off = y + 42
+    for m_data in (opus, gemini):
+        if not m_data:
+            continue
+        label = "Opus 4.6" if m_data.get('modelId') == 'claude-opus-4-6-thinking' else "Gemini 3Pro"
+        pct = m_data.get('usedPercentage', 0)
+        rem_time = time_until(m_data.get('resetDate'))
+
+        draw.text((x + 64, y_off), f"{label} {pct}% | In {rem_time}", font=FONTS['20'], fill=THEME['muted'])
+        draw_bar(draw, x + 64, y_off + 24, 340, 16, pct)
+        y_off += 52
+
+
+def widget_ping(img, draw, x, y, ping):
+    ms = ping['current']
+    color = THEME['ok'] if 0 < ms < 50 else THEME['warn'] if ms < 120 else THEME['alert']
+    draw_icon(img, x, y, "icon_wifi", (50, 50), color)
+    draw.text((x + 64, y + 2), f"Internet Quality: {ms} ms", font=FONTS['28'], fill=THEME['fg'])
+    draw_sparkline(draw, x, y + 62, list(ping['history']), max_items=50, width=420,
+                   height=60, color=color, style="bar")
+
+
+def _fmt_ms(ms):
+    s = max(0, int(ms)) // 1000
+    return f"{s // 60}:{s % 60:02d}"
+
+
+# Tap targets for the music transport controls, rebuilt each render:
+# [(x0, y0, x1, y1, 'prev'|'playpause'|'next')]. Empty when no track is shown.
+MUSIC_HITS = []
+
+
+def widget_music(img, draw, x, y, music):
+    global MUSIC_HITS
+    MUSIC_HITS = []
+    right = inner_right(1)
+    width = right - x
+    music = music or {}
+    title = music.get('title', '')
+    playing = music.get('status') == 'playing'
+    has_track = bool(title)
+
+    # Header: a small Bluetooth glyph + status.
+    draw_icon(img, x, y, "icon_spotify", (30, 30),
+              THEME['ok'] if has_track else THEME['muted'])
+    hdr = "NOW PLAYING" if has_track else (
+        "Bluetooth connected" if music.get('connected') else "Bluetooth: pair a phone")
+    draw.text((x + 40, y + 2), hdr, font=FONTS['20'], fill=THEME['muted'])
+
+    if not has_track:
+        draw.text((x, y + 48), "No music playing", font=FONTS['28'], fill=THEME['muted'])
+        draw.text((x, y + 84), "Hold 5s -> Settings -> Bluetooth", font=FONTS['20'], fill=THEME['line'])
+        return
+
+    # Song + artist (CJK-capable font so Chinese/Japanese/Korean names render).
+    draw.text((x, y + 36), title[:24], font=FONTS['cjk'], fill=THEME['fg'])
+    draw.text((x, y + 76), music.get('artist', '')[:30], font=FONTS['cjk_sm'], fill=THEME['muted'])
+
+    # Progress bar with position dot.
+    bar_y = y + 116
+    dur = music.get('duration_ms', 0)
+    now = music.get('now_ms', 0)
+    frac = min(max(now / dur, 0.0), 1.0) if dur else 0.0
+    draw.line((x, bar_y, right, bar_y), fill=THEME['line'], width=3)
+    if dur:
+        fill_x = x + int(width * frac)
+        draw.line((x, bar_y, fill_x, bar_y), fill=THEME['accent'], width=3)
+        draw.ellipse((fill_x - 8, bar_y - 8, fill_x + 8, bar_y + 8), fill=THEME['accent'])
+    draw.text((x, bar_y + 12), _fmt_ms(now), font=FONTS['20'], fill=THEME['muted'])
+    if dur:
+        draw_text_right(draw, right, bar_y + 12, _fmt_ms(dur), FONTS['20'], THEME['muted'])
+
+    # Playback controls: prev | play/pause | next (tappable).
+    cy = y + 170
+    cx = (x + right) // 2
+    ctrl = THEME['fg']
+    # prev
+    draw.polygon([(cx - 74, cy - 12), (cx - 74, cy + 12), (cx - 90, cy)], fill=ctrl)
+    draw.rectangle((cx - 94, cy - 12, cx - 90, cy + 12), fill=ctrl)
+    # next
+    draw.polygon([(cx + 74, cy - 12), (cx + 74, cy + 12), (cx + 90, cy)], fill=ctrl)
+    draw.rectangle((cx + 90, cy - 12, cx + 94, cy + 12), fill=ctrl)
+    # play / pause in a circle
+    draw.ellipse((cx - 26, cy - 26, cx + 26, cy + 26), outline=THEME['accent'], width=3)
+    if playing:
+        draw.rectangle((cx - 10, cy - 12, cx - 3, cy + 12), fill=THEME['accent'])
+        draw.rectangle((cx + 3, cy - 12, cx + 10, cy + 12), fill=THEME['accent'])
+    else:
+        draw.polygon([(cx - 8, cy - 13), (cx - 8, cy + 13), (cx + 14, cy)], fill=THEME['accent'])
+
+    # Generous tap targets around each control.
+    MUSIC_HITS = [
+        (cx - 116, cy - 34, cx - 52, cy + 34, 'prev'),
+        (cx - 40, cy - 34, cx + 40, cy + 34, 'playpause'),
+        (cx + 52, cy - 34, cx + 116, cy + 34, 'next'),
+    ]
+
+
+def widget_claude(img, draw, x, y, claude):
+    draw.text((x, y), "CLAUDE AI USAGE", font=FONTS['28'], fill=THEME['fg'])
+
+    if claude.get('error'):
+        draw.text((x, y + 50), "Claude Usage Error", font=FONTS['24'], fill=THEME['alert'])
+        return
+
+    pct_5h = claude.get('five_hour', {}).get('utilization', 0)
+    rem_5h = time_until(claude.get('five_hour', {}).get('resets_at'))
+    draw.text((x, y + 40), f"5-Hour Limit: {pct_5h}% (Resets in {rem_5h})", font=FONTS['20'], fill=THEME['muted'])
+    draw_bar(draw, x, y + 66, 400, 16, pct_5h)
+
+    pct_7d = claude.get('seven_day', {}).get('utilization', 0)
+    rem_7d = time_until(claude.get('seven_day', {}).get('resets_at'))
+    draw.text((x, y + 94), f"7-Day Limit: {pct_7d}% (Resets in {rem_7d})", font=FONTS['20'], fill=THEME['muted'])
+    draw_bar(draw, x, y + 120, 400, 16, pct_7d)
+
+
+def widget_spotify(img, draw, x, y, spotify):
+    if spotify['cover']:
+        img.paste(spotify['cover'], (x, y))
+    else:
+        draw_icon(img, x, y, "icon_spotify", (COVER_SIZE, COVER_SIZE), THEME['ok'])
+
+    playing = spotify['status'] == 'PLAYING'
+    draw_icon(img, x + COVER_SIZE + 20, y + 10, "icon_play" if playing else "icon_pause",
+              (30, 30), THEME['ok'] if playing else THEME['muted'])
+
+    if playing:
+        words = spotify['text'].split(' - ')
+        artist = words[0] if words else "Unknown"
+        track = words[1] if len(words) > 1 else ""
+        draw.text((x + COVER_SIZE + 60, y + 10), artist[:20], font=FONTS['28'], fill=THEME['fg'])
+        draw.text((x + COVER_SIZE + 60, y + 54), track[:26], font=FONTS['24'], fill=THEME['muted'])
+    else:
+        draw.text((x + COVER_SIZE + 60, y + 10), "Paused", font=FONTS['28'], fill=THEME['muted'])
+
+
+def widget_time_progress(img, draw, x, y, dt):
+    draw.text((x, y), "TIME PROGRESS", font=FONTS['28'], fill=THEME['fg'])
+
+    day_pct = (dt.hour * 3600 + dt.minute * 60 + dt.second) / 86400.0
+    days_in_m = calendar.monthrange(dt.year, dt.month)[1]
+    month_pct = (dt.day - 1 + (dt.hour / 24.0)) / days_in_m
+    days_in_y = 366 if calendar.isleap(dt.year) else 365
+    year_pct = (dt.timetuple().tm_yday - 1 + (dt.hour / 24.0)) / days_in_y
+
+    def draw_prog(y_offset, label, pct):
+        draw.text((x, y + y_offset), label, font=FONTS['24'], fill=THEME['muted'])
+        bx, bw, bh = x + 130, 220, 20
+        draw_bar(draw, bx, y + y_offset + 2, bw, bh, pct * 100, THEME['accent'])
+        draw.text((bx + bw + 16, y + y_offset), f"{int(pct * 100)}%", font=FONTS['24'], fill=THEME['fg'])
+
+    draw_prog(42, "DAY", day_pct)
+    draw_prog(80, "MONTH", month_pct)
+    draw_prog(118, "YEAR", year_pct)
+
+
+def widget_weather(img, draw, col, weather, aqi, location_label=''):
+    x = inner_x(col)
+    right = inner_right(col)
+
+    # On-screen we show just the city; the full "City, Region" stays in logs.
+    city = location_label.split(',')[0].strip()
+
+    if 'current' not in weather:
+        draw.text((x, ROW1_Y + 60), "Waiting for weather data...", font=FONTS['24'], fill=THEME['muted'])
+        if city:
+            draw.text((x, ROW1_Y + 92), city, font=FONTS['20'], fill=THEME['line'])
+        return
+
+    cur = weather['current']
+    temp = cur.get('temperature_2m', 0)
+    hum = cur.get('relative_humidity_2m', 0)
+    pres = cur.get('surface_pressure', 0)
+    w_code = cur.get('weather_code', 0)
+    wind_dir = cur.get('wind_direction_10m', 0)
+    wind_spd = cur.get('wind_speed_10m', 0)
+    is_day = cur.get('is_day', 1)
+    uv_index = cur.get('uv_index', 0.0)
+
+    # --- Row A: current conditions ---
+    draw_icon(img, x, 20, get_weather_icon(w_code, is_day), (84, 84), THEME['accent'])
+    draw.text((x + 96, 4), f"{math.floor(temp + 0.5)}°C", font=FONTS['80'], fill=THEME['fg'])
+    draw.text((x + 96, 92), f"Humidity: {hum}%", font=FONTS['20'], fill=THEME['muted'])
+    draw.text((x + 96, 114), f"Press: {pres} hPa", font=FONTS['20'], fill=THEME['muted'])
+
+    uv_rounded = math.floor(uv_index + 0.5)
+    uv_str = str(uv_rounded)
+    draw.text((x + 336, 24), "UV", font=FONTS['20'], fill=THEME['muted'])
+    uv_w, _ = text_size(draw, uv_str, FONTS['60'])
+    uv_x = right - uv_w
+    if uv_rounded >= 6:
+        draw_badge(draw, uv_x, 20, uv_str, FONTS['60'], THEME['warn'])
+    else:
+        draw.text((uv_x, 20), uv_str, font=FONTS['60'], fill=THEME['fg'])
+
+    # City name, right-aligned under the UV reading (clear of the humidity text
+    # on the left). Kept to the city alone so it never runs into it.
+    if city:
+        draw_text_right(draw, right, 96, city[:16], FONTS['20'], THEME['muted'])
+
+    hline(draw, x, right, 130)
+
+    # --- Row B: wind compass + air quality ---
+    draw_icon(img, x + 2, 146, "icon_wind", (26, 26), THEME['muted'])
+
+    cx, cy, r = x + 80, 228, 58
+    draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=THEME['line'], width=2)
+
+    for angle in range(0, 360, 45):
+        rad_tick = math.radians(angle)
+        inner_r = r - 8 if angle % 90 == 0 else r - 4
+        tx1, ty1 = cx + inner_r * math.cos(rad_tick), cy + inner_r * math.sin(rad_tick)
+        tx2, ty2 = cx + r * math.cos(rad_tick), cy + r * math.sin(rad_tick)
+        draw.line((tx1, ty1, tx2, ty2), fill=THEME['line'], width=2)
+
+    draw.text((cx - 8, cy - r - 22), "N", font=FONTS['20'], fill=THEME['muted'])
+    draw.text((cx - 8, cy + r + 2), "S", font=FONTS['20'], fill=THEME['muted'])
+    draw.text((cx + r + 6, cy - 10), "E", font=FONTS['20'], fill=THEME['muted'])
+    draw.text((cx - r - 24, cy - 10), "W", font=FONTS['20'], fill=THEME['muted'])
+
+    rad_arrow = math.radians(wind_dir - 90)
+    tip_x = cx + (r - 12) * math.cos(rad_arrow)
+    tip_y = cy + (r - 12) * math.sin(rad_arrow)
+    base_angle = math.radians(150)
+    left_x = cx + 20 * math.cos(rad_arrow + base_angle)
+    left_y = cy + 20 * math.sin(rad_arrow + base_angle)
+    right_x = cx + 20 * math.cos(rad_arrow - base_angle)
+    right_y = cy + 20 * math.sin(rad_arrow - base_angle)
+    draw.polygon([(tip_x, tip_y), (left_x, left_y), (right_x, right_y)], fill=THEME['accent'])
+    draw.ellipse((cx - 4, cy - 4, cx + 4, cy + 4), fill=THEME['accent'])
+    draw_text_center(draw, cx, cy + 26, f"{wind_spd} km/h", FONTS['20'], THEME['fg'])
+
+    aqi_x = x + 206
+    draw.text((aqi_x, 152), "AIR QUALITY", font=FONTS['20'], fill=THEME['muted'])
+    draw.text((aqi_x, 196), "AQI:", font=FONTS['28'], fill=THEME['fg'])
+
+    aqi_str = str(aqi)
+    aqi_w, _ = text_size(draw, aqi_str, FONTS['80'])
+    aqi_val_x = right - aqi_w
+    if aqi >= 50:
+        draw_badge(draw, aqi_val_x, 186, aqi_str, FONTS['80'], THEME['alert'])
+    else:
+        draw.text((aqi_val_x, 186), aqi_str, font=FONTS['80'],
+                  fill=THEME['ok'] if aqi <= 20 else THEME['fg'])
+
+    hline(draw, x, right, 306)
+
+    # --- Row C: 4-hour forecast ---
+    hourly = weather.get('hourly', {})
+    times = hourly.get('time', [])
+    temps = hourly.get('temperature_2m', [])
+    codes = hourly.get('weather_code', [])
+
+    cur_iso = datetime.now().strftime("%Y-%m-%dT%H:00")
+    try:
+        start_idx = times.index(cur_iso) + 1
+    except ValueError:
+        start_idx = 0
+
+    slot_w = (right - x) // 4
+    for i in range(4):
+        idx = start_idx + i
+        if idx >= len(times):
+            break
+        off_x = x + i * slot_w
+        draw.text((off_x + 6, 318), times[idx].split('T')[1][:5], font=FONTS['24'], fill=THEME['muted'])
+        draw_icon(img, off_x + 14, 348, get_weather_icon(codes[idx], 1), (48, 48), THEME['fg'])
+        draw.text((off_x + 6, 398), f"{math.floor(temps[idx] + 0.5)}°C", font=FONTS['24'], fill=THEME['fg'])
+
+
+def widget_clock_panel(img, draw, col, dt, gmail_unread, updated_at):
+    x = inner_x(col)
+    right = inner_right(col)
+
+    draw_text_center(draw, (x + right) // 2, 6, dt.strftime("%H:%M"), FONTS['clock'], THEME['accent'])
+
+    draw.text((x, 168), dt.strftime("%d %B %Y"), font=FONTS['32'], fill=THEME['fg'])
+    draw_text_right(draw, right, 168, dt.strftime("%a").upper(), FONTS['32'], THEME['muted'])
+
+    hline(draw, x, right, 214)
+
+    # Gmail
+    has_mail = gmail_unread > 0
+    draw_icon(img, x, 230, "icon_mail", (60, 60), THEME['accent'] if has_mail else THEME['muted'])
+    draw.text((x + 80, 242), f"Unread Inbox: {gmail_unread}", font=FONTS['35'],
+              fill=THEME['fg'] if has_mail else THEME['muted'])
+
+    hline(draw, x, right, 316)
+
+    # Status footer
+    stamp = datetime.fromtimestamp(updated_at).strftime("%H:%M") if updated_at else "--:--"
+    draw.text((x, 330), f"Updated {stamp}", font=FONTS['24'], fill=THEME['muted'])
+    draw_icon(img, x, 368, "icon_wifi", (24, 24), THEME['muted'])
+    draw.text((x + 34, 370), get_local_ip(), font=FONTS['20'], fill=THEME['muted'])
+    draw_text_right(draw, right, 372, "tap: refresh | hold: theme | 5s: settings", FONTS['16'], THEME['line'])
+
+
+def _music_hit(pos):
+    """Return the music transport control at pos ('prev'/'playpause'/'next'), or None."""
+    px, py = pos
+    for x0, y0, x1, y1, action in MUSIC_HITS:
+        if x0 <= px <= x1 and y0 <= py <= y1:
+            return action
+    return None
+
+
+def draw_hold_hint(img, frac):
+    """Overlay a progress banner while the user holds toward the 5s settings gesture."""
+    draw = ImageDraw.Draw(img)
+    bw, bh = 560, 88
+    x0 = (SCREEN_W - bw) // 2
+    y0 = (SCREEN_H - bh) // 2
+    draw.rounded_rectangle((x0, y0, x0 + bw, y0 + bh), radius=14,
+                           fill=THEME['bg'], outline=THEME['accent'], width=3)
+    draw_text_center(draw, SCREEN_W // 2, y0 + 12, "Keep holding for Settings",
+                     FONTS['28'], THEME['fg'])
+    bx, by, bwid = x0 + 30, y0 + 56, bw - 60
+    draw.rounded_rectangle((bx, by, bx + bwid, by + 16), radius=8, outline=THEME['line'])
+    fillw = int(bwid * min(max(frac, 0.0), 1.0))
+    if fillw > 4:
+        draw.rounded_rectangle((bx, by, bx + fillw, by + 16), radius=8, fill=THEME['accent'])
+
+
+# --- SCREEN COMPOSITION ---
+def render_screen():
+    img = Image.new('RGB', (SCREEN_W, SCREEN_H), THEME['bg'])
+    draw = ImageDraw.Draw(img)
+
+    if not data_store.lock.acquire(timeout=2.0):
+        return img
+    try:
+        weather = data_store.weather.copy()
+        aqi = data_store.aqi
+        strava = data_store.strava.copy()
+        printer = data_store.printer.copy()
+        rob = data_store.roborock.copy()
+        gmail_unread = data_store.gmail_unread
+        spotify = data_store.spotify.copy()
+        claude = data_store.claude.copy()
+        antigravity = data_store.antigravity.copy()
+        sysload = dict(data_store.sysload, history=list(data_store.sysload['history']))
+        market = {k: dict(v) for k, v in data_store.market.items()}
+        ping = dict(data_store.ping, history=list(data_store.ping['history']))
+        location = data_store.location.copy()
+        updated_at = data_store.updated_at
+    finally:
+        data_store.lock.release()
+
+    dt = datetime.now()
+
+    # Column dividers
+    for col_x in COL_X[1:]:
+        draw.line((col_x, 12, col_x, BOTTOM_Y + 4), fill=THEME['line'], width=2)
+
+    # --- COLUMN 1: 3D printer (top) + markets (bottom) ---
+    c1 = inner_x(0)
+    if ENABLE_STRAVA:
+        widget_strava(img, draw, c1, ROW1_Y, strava)
+    else:
+        widget_bambu(img, draw, c1, ROW1_Y, printer)
+    hline(draw, c1, inner_right(0), ROW_RULE_Y)
+    widget_markets(img, draw, c1, ROW2_Y, market)
+
+    # --- COLUMN 2: home / AI usage ---
+    c2 = inner_x(1)
+    if ENABLE_ROBOROCK:
+        widget_roborock(img, draw, c2, ROW1_Y, rob)
+    elif ENABLE_ANTIGRAVITY:
+        widget_antigravity(img, draw, c2, ROW1_Y, antigravity)
+    else:
+        widget_music(img, draw, c2, ROW1_Y, bt.music_snapshot() if bt else None)
+    hline(draw, c2, inner_right(1), ROW_RULE_Y)
+    if ENABLE_CLAUDE:
+        widget_claude(img, draw, c2, ROW2_Y, claude)
+    elif ENABLE_SPOTIFY:
+        widget_spotify(img, draw, c2, ROW2_Y, spotify)
+    else:
+        widget_time_progress(img, draw, c2, ROW2_Y, dt)
+
+    # --- COLUMN 3: weather (full height) ---
+    widget_weather(img, draw, 2, weather, aqi, location.get('label', ''))
+
+    # --- COLUMN 4: clock, mail, status ---
+    widget_clock_panel(img, draw, 3, dt, gmail_unread, updated_at)
+
+    return img
+
+
+# Noto Sans CJK, for song/artist names that contain Chinese/Japanese/Korean
+# (the Aldrich display font is Latin-only). First existing path wins; falls
+# back to Aldrich if the CJK font isn't installed (e.g. on a dev box).
+_CJK_FONT_PATHS = [
+    '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+    '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc',
+]
+
+
+def load_fonts():
+    def load(name, size):
+        return ImageFont.truetype(os.path.join(FONT_DIR, name), size)
+
+    def load_cjk(size):
+        for p in _CJK_FONT_PATHS:
+            if os.path.exists(p):
+                return ImageFont.truetype(p, size)
+        return load('Aldrich-Regular.ttc', size)
+
+    return {
+        '16': load('Aldrich-Regular.ttc', 16),
+        '20': load('Aldrich-Regular.ttc', 20),
+        '24': load('Aldrich-Regular.ttc', 24),
+        '28': load('Aldrich-Regular.ttc', 28),
+        '32': load('Aldrich-Regular.ttc', 32),
+        '35': load('Aldrich-Regular.ttc', 35),
+        '40': load('Aldrich-Regular.ttc', 40),
+        '60': load('Aldrich-Regular.ttc', 60),
+        '80': load('Aldrich-Regular.ttc', 80),
+        'clock': load('advanced_led_board-7.ttc', 170),
+        'cjk': load_cjk(30),
+        'cjk_sm': load_cjk(23),
+    }
+
+
+FONTS = {}
+
+
+def start_threads(roborock_user_data):
+    global bt
+    bt = bluetooth_music.BtMusic("Pi_Dashboard")
+    bt.start()
+
+    t_data = threading.Thread(target=update_data_thread, daemon=True)
+    t_data.start()
+
+    if ENABLE_ROBOROCK:
+        t_robo = threading.Thread(target=roborock_update_thread,
+                                  args=(roborock_user_data, ROBOROCK_CONF['EMAIL']),
+                                  daemon=True)
+        t_robo.start()
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Pi Dashboard for the GeeekPi 11.26\" 1920x440 HDMI LCD")
+    p.add_argument('--preview', metavar='PNG', nargs='?', const='preview.png',
+                   help="Render a single frame to a PNG and exit (no display needed)")
+    p.add_argument('--windowed', action='store_true',
+                   help="Run in a window instead of fullscreen (for desktop testing)")
+    p.add_argument('--theme', choices=('dark', 'light'), default='dark')
+    return p.parse_args()
+
+
+# --- MAIN LOOP ---
+def main():
+    global FONTS
+
+    args = parse_args()
+    if args.theme != THEME_NAME:
+        toggle_theme()
+
+    load_runtime_settings()  # apply on-screen-saved ZIP over the code default
+    FONTS = load_fonts()
+
+    if args.preview:
+        out = args.preview if os.path.isabs(args.preview) else os.path.join(BASE_DIR, args.preview)
+        render_screen().save(out)
+        print(f"Wrote {out}")
+        return
+
+    auth_strava()
+    auth_claude()
+    auth_antigravity()
+    roborock_user_data = auth_roborock(ROBOROCK_CONF['EMAIL'])
+
+    try:
+        screen = display_backend.Display(SCREEN_W, SCREEN_H, fullscreen=not args.windowed)
+    except display_backend.DisplayUnavailable as e:
+        logging.critical(f"Cannot open the LCD: {e}")
+        logging.critical("Try `python3 main.py --preview` to check rendering without a display.")
+        return
+
+    # Screen power: turn the panel off when idle, wake it on touch. The touch
+    # thread updates `activity['t']` (monotonic) from the kernel touch device.
+    activity = {'t': time.monotonic()}
+
+    def note_activity():
+        activity['t'] = time.monotonic()
+
+    power = display_backend.ScreenPower(on_activity=note_activity)
+    power.start()
+
+    start_threads(roborock_user_data)
+
+    settings_ctx = build_settings_ctx()
+    last_key = None
+    last_forced = 0.0
+    wake_time = 0.0
+    screen_was_on = True
+    frames = 0
+    menu = None           # settings_ui.SettingsUI instance while open, else None
+    last_menu_draw = 0.0
+
+    try:
+        while True:
+            force = False
+            now_m = time.monotonic()
+
+            # Detect a wake done by the touch thread (before handling events, so
+            # the waking touch is inside the guard window below) and repaint.
+            is_on = power.is_on
+            if is_on and not screen_was_on:
+                wake_time = now_m
+                last_key = None  # force a full repaint after the blank
+            screen_was_on = is_on
+
+            for kind, pos in screen.poll():
+                if kind == display_backend.QUIT:
+                    raise KeyboardInterrupt
+                note_activity()
+                # Swallow the action of the touch that woke the screen.
+                if now_m - wake_time < WAKE_GUARD_SECONDS:
+                    force = True
+                    continue
+
+                if menu is not None:
+                    # In settings, every touch is routed to the on-screen menu.
+                    if kind in (display_backend.TAP, display_backend.LONG_PRESS,
+                                display_backend.SETTINGS):
+                        if menu.handle_tap(pos[0], pos[1]) == 'exit':
+                            menu = None
+                            last_key = None  # repaint the dashboard
+                    force = True
+                    continue
+
+                if kind == display_backend.SETTINGS:
+                    logging.info("Entering settings")
+                    power.screen_on()
+                    menu = settings_ui.SettingsUI(FONTS, THEME, SCREEN_W, SCREEN_H,
+                                                  settings_ctx)
+                    force = True
+                elif kind == display_backend.LONG_PRESS:
+                    toggle_theme()  # icon cache holds colour-independent masks, no need to clear
+                elif kind == display_backend.TAP and (music_action := _music_hit(pos)):
+                    # Tap landed on a music transport control -> drive the phone.
+                    if bt:
+                        if music_action == 'playpause':
+                            bt.play_pause()
+                        elif music_action == 'next':
+                            bt.next()
+                        elif music_action == 'prev':
+                            bt.previous()
+                elif time.time() - last_forced > TAP_REFRESH_COOLDOWN:
+                    # Rate-limited so repeated taps cannot hammer the upstream APIs.
+                    logging.info("Touch: forcing data refresh")
+                    data_store.force_refresh()
+                    last_forced = time.time()
+                force = True
+
+            # --- Settings mode: render the menu/sub-screen, never sleep ---
+            if menu is not None:
+                if menu.dirty or (menu.animating and now_m - last_menu_draw > 0.25):
+                    try:
+                        screen.show(menu.render())
+                        menu.dirty = False
+                        last_menu_draw = now_m
+                    except Exception as e:
+                        logging.error(f"Settings UI render error: {e}")
+                screen.tick(EVENT_POLL_FPS)
+                continue
+
+            # Once idle long enough, cut the HDMI signal (backlight off). The
+            # data threads keep running; only the panel sleeps.
+            if is_on and SCREEN_OFF_SECONDS and (now_m - activity['t'] > SCREEN_OFF_SECONDS):
+                power.screen_off()
+                is_on = screen_was_on = False
+
+            # A hold heading toward the 5s WiFi gesture: show a progress hint.
+            hold = screen.hold_seconds() if is_on else 0.0
+            hinting = hold >= 2.5
+            if hinting:
+                force = True
+
+            # Re-render only when the screen is on and something visible changed:
+            # the minute, the data revision, the theme, or a touch. While music
+            # is playing, add a per-second tick so the progress bar advances.
+            if is_on:
+                if bt:
+                    _snap = bt.music_snapshot()
+                    # Repaint on status/track change, and every second while
+                    # playing so the progress bar advances.
+                    music_key = (_snap['status'], _snap['title'],
+                                 int(now_m) if _snap['status'] == 'playing' else 0)
+                else:
+                    music_key = None
+                key = (datetime.now().strftime('%H:%M'), data_store.rev, THEME_NAME, music_key)
+                if force or key != last_key:
+                    try:
+                        image = render_screen()
+                        if hinting:
+                            draw_hold_hint(image, hold / display_backend.SETTINGS_HOLD_SEC)
+                        screen.show(image)
+                        del image
+                        last_key = None if hinting else key
+                        frames += 1
+                        if frames % 60 == 0:
+                            gc.collect()
+                    except OSError as e:
+                        if e.errno == 24:  # too many open fds - restart clean
+                            logging.critical("FD exhaustion, restarting")
+                            logging.shutdown()
+                            os.execv(sys.executable, ['python3'] + sys.argv)
+                        logging.error(f"Render error: {e}")
+                    except Exception as e:
+                        logging.error(f"Unexpected error in main: {e}")
+
+            screen.tick(EVENT_POLL_FPS)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        power.screen_on()  # never leave the panel dark for the next run
+        screen.close()
+
+
+if __name__ == '__main__':
+    main()

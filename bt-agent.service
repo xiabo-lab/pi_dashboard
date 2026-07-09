@@ -1,0 +1,28 @@
+# Headless Bluetooth pairing agent for the Pi Dashboard.
+#
+# The dashboard has only a touchscreen - no keyboard - so when a new phone tries
+# to pair, something must accept the pairing on the Pi's behalf. bt-agent (from
+# bluez-tools) registers a NoInputNoOutput agent that auto-accepts the "Just
+# Works" pairing modern phones use. The app itself only flips the adapter
+# Discoverable/Pairable while Settings -> Bluetooth -> Pair New Phone is open.
+#
+# Install:
+#     sudo apt install -y bluez-tools
+#     sudo cp bt-agent.service /etc/systemd/system/
+#     sudo systemctl enable --now bt-agent
+
+[Unit]
+Description=Bluetooth auto-pairing agent (NoInputNoOutput) for Pi Dashboard
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+ExecStart=/usr/bin/bt-agent --capability=NoInputNoOutput
+Restart=always
+RestartSec=2
+# bt-agent ignores SIGTERM, so send SIGKILL first to avoid blocking shutdown.
+KillSignal=SIGKILL
+TimeoutStopSec=2s
+
+[Install]
+WantedBy=multi-user.target

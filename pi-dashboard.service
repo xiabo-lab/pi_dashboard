@@ -1,0 +1,52 @@
+# Pi Dashboard - GeeekPi 11.26" 1920x440 HDMI LCD.
+#
+# The dashboard is a pygame app with no window manager under it, so on a
+# Raspberry Pi OS *Lite* (console-only) image it runs inside `cage`, a
+# single-app Wayland kiosk compositor. `seatd` gives cage a seat without a full
+# desktop session. This is why the dashboard cannot be launched from a plain
+# SSH session - there is no seat there - and must be started by systemd.
+#
+# cage always runs its single client fullscreen; `-s` merely allows VT switching
+# (so Ctrl+Alt+F1 still reaches a console). SDL then auto-selects its wayland
+# driver -- do NOT set SDL_VIDEODRIVER=kmsdrm here, it fails on this hardware.
+#
+# Install:
+#     sudo apt install -y python3-pygame python3-pil python3-requests cage seatd wlr-randr
+#     sudo systemctl enable --now seatd
+#     sudo cp pi-dashboard.service /etc/systemd/system/
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now pi-dashboard
+#     journalctl -u pi-dashboard -f
+#
+# NOTE: the ExecStart path below is for user `pi`. If your Pi user differs,
+# change both the path and User=/Group= to match, or the unit restart-loops with
+# "can't open file ... No such file or directory".
+
+[Unit]
+Description=Pi Dashboard (cage + pygame, 1920x440 bar LCD)
+After=network-online.target seatd.service
+Wants=network-online.target seatd.service
+
+[Service]
+# cage needs DRM master, which a plain User= service does not get - it has no
+# seat. Running the compositor as root is what the sibling carlyrics deployment
+# does on this same Pi.
+User=root
+Environment=XDG_RUNTIME_DIR=/tmp
+# Deliberately NO SDL_VIDEODRIVER. Measured on this Pi (cage 0.2, SDL 2.32.4):
+#   kmsdrm  -> fails to start
+#   wayland -> pygame.init() succeeds but set_mode() never returns (hangs)
+#   <auto>  -> picks x11 via cage's Xwayland; set_mode returns 1920x440, and
+#              SDL still enumerates the ILITEK touchscreen (1 touch device),
+#              so FINGERDOWN/FINGERUP are delivered normally.
+# Xwayland costs ~50MB RSS, which is the price of the only backend that works.
+# Unbuffered so `journalctl -f` shows log lines as they happen, not in 4K blocks.
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/home/pi/Pi_dashboard
+ExecStart=/usr/bin/cage -s -- /usr/bin/python3 /home/pi/Pi_dashboard/main.py
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
