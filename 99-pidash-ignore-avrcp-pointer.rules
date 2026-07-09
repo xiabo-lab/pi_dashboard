@@ -1,0 +1,13 @@
+# Stop a paired phone's AVRCP Bluetooth media-remote from showing a mouse cursor.
+#
+# When the phone connects, BlueZ creates a virtual input device "<phone> (AVRCP)"
+# that advertises relative-pointer (EV_REL) capability alongside its media keys.
+# libinput therefore presents it to cage/wlroots as a pointer, and cage pops a
+# cursor onto the screen the moment it hot-plugs. The dashboard reads playback
+# metadata over BlueZ D-Bus (MediaPlayer1), NOT from this input device, so
+# libinput can ignore it entirely.
+#
+# Install:
+#     sudo cp 99-pidash-ignore-avrcp-pointer.rules /etc/udev/rules.d/
+#     sudo udevadm control --reload && sudo udevadm trigger
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="* (AVRCP)", ENV{LIBINPUT_IGNORE_DEVICE}="1"

@@ -193,7 +193,7 @@ sudo systemctl restart pi-dashboard
 
 ### Bluetooth music widget
 
-Column 2's upper slot shows a **now-playing** widget (`bluetooth_music.py`): pair a phone (the Pi's Bluetooth name is **`Pi_Dashboard`**) and it reads the current track over BlueZ AVRCP — song, artist, play/pause, and a live progress bar — while the phone plays from YouTube Music (or any app). No audio backend is needed: the metadata rides the AVRCP control channel, which the Pi connects explicitly. Adapted from the sibling [carlyrics](https://github.com/xiabo-lab) project. Pair via **Settings → Bluetooth → Pair New Phone**. Requires `python3-dbus-next` and `bluez-tools` (bt-agent, deployed as `bt-agent.service` for headless "Just Works" pairing).
+Column 2's upper slot shows a **now-playing** widget (`bluetooth_music.py`): pair a phone (the Pi's Bluetooth name is **`Pi_Dashboard`**) and it reads the current track over BlueZ AVRCP — song, artist, play/pause, and a live progress bar — while the phone plays from YouTube Music (or any app). No audio backend is needed: the metadata rides the AVRCP control channel, which the Pi connects explicitly. Adapted from the sibling [carlyrics](https://github.com/xiabo-lab) project. Song/artist render with Noto Sans CJK (`fonts-noto-cjk`) so non-Latin names show. Tap the on-screen prev / play-pause / next controls to drive playback. Pair via **Settings → Bluetooth → Pair New Phone**. Requires `python3-dbus-next` and `bluez-tools` (bt-agent, deployed as `bt-agent.service` for headless "Just Works" pairing). A phone's AVRCP device otherwise pops a mouse cursor on screen; `99-pidash-ignore-avrcp-pointer.rules` (copy to `/etc/udev/rules.d/`) tells libinput to ignore it.
 
 ### Settings menu (on-screen, no keyboard needed)
 

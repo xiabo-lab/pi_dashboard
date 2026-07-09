@@ -1701,17 +1701,21 @@ def widget_clock_panel(img, draw, col, dt, gmail_unread, updated_at):
 
     hline(draw, x, right, 316)
 
-    # Status footer
+    # Status footer: "Updated" + IP on one row, gesture hint on its own line
+    # below so they can't overlap.
     stamp = datetime.fromtimestamp(updated_at).strftime("%H:%M") if updated_at else "--:--"
-    draw.text((x, 330), f"Updated {stamp}", font=FONTS['24'], fill=THEME['muted'])
-    draw_icon(img, x, 368, "icon_wifi", (24, 24), THEME['muted'])
-    draw.text((x + 34, 370), get_local_ip(), font=FONTS['20'], fill=THEME['muted'])
-    draw_text_right(draw, right, 372, "tap: refresh | hold: theme | 5s: settings", FONTS['16'], THEME['line'])
+    draw.text((x, 332), f"Updated {stamp}", font=FONTS['24'], fill=THEME['muted'])
+    draw_icon(img, x, 366, "icon_wifi", (24, 24), THEME['muted'])
+    draw.text((x + 34, 368), get_local_ip(), font=FONTS['20'], fill=THEME['muted'])
+    draw_text_right(draw, right, 402, "tap: refresh · hold: theme · 5s: settings", FONTS['16'], THEME['line'])
 
 
 # --- Screensaver (moving clock on black; prevents burn-in without an OSD) ---
-SS_TIME_COLOR = (120, 175, 255)
-SS_DATE_COLOR = (120, 130, 150)
+# The panel has no backlight control, so "lowest brightness" is done in software:
+# very dim text on black. It stays readable up close but emits little light. The
+# dashboard renders at full brightness, so touching the screen restores normal.
+SS_TIME_COLOR = (46, 66, 96)
+SS_DATE_COLOR = (40, 46, 58)
 SS_SPEED = 55.0  # drift speed, px/sec
 
 
