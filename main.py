@@ -126,13 +126,15 @@ API_ENDPOINTS = {
 #   4. LOCATION_LAT/LON - hardcoded fallback, used only if all the above are off
 #                        or fail (no internet yet, API down).
 #
-# Currently PINNED to ZIP an unset ZIP. To make the weather follow the
-# Pi automatically instead, set LOCATION_ZIP = '' and USE_IP_LOCATION = True.
-LOCATION_ZIP = '00000'
+# Ships unpinned: no ZIP, so the weather follows the Pi via IP geolocation. To
+# pin it to a fixed spot, either set LOCATION_ZIP here or — better, since it
+# stays out of the repo — set it on-screen (hold 5s -> Settings -> Zip Code),
+# which saves to the gitignored settings.json and overrides this default.
+LOCATION_ZIP = ''
 LOCATION_ZIP_COUNTRY = 'us'
 LOCATION_CITY = ''
-USE_IP_LOCATION = False
-LOCATION_LAT = 51.4779   # 00000 fallback, used only if the ZIP lookup is down
+USE_IP_LOCATION = True
+LOCATION_LAT = 51.4779   # Greenwich - placeholder, used only if everything else fails
 LOCATION_LON = -0.0015
 LOCATION_LABEL = 'Greenwich'
 

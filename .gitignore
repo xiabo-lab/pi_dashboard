@@ -3,6 +3,9 @@ token.json
 credentials.json
 claude_creds.json
 device_conf.json
+
+# --- Local machine config (paths, hostnames, per-user tool settings) ---
+.claude/settings.local.json
 strava_token.json
 roborock_session.pkl
 *.pkl
