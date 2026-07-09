@@ -930,7 +930,7 @@ def update_data_thread():
         if now - data_store.last_update['weather'] > 600:
             loc = data_store.location
             lat, lon = loc['lat'], loc['lon']
-            weather_url = f"{API_ENDPOINTS['weather']}?latitude={lat}&longitude={lon}&current=temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m,wind_direction_10m,weather_code,is_day,uv_index&hourly=temperature_2m,precipitation_probability,weather_code,cloud_cover&timezone=auto&forecast_days=2"
+            weather_url = f"{API_ENDPOINTS['weather']}?latitude={lat}&longitude={lon}&current=temperature_2m,wind_speed_10m,wind_direction_10m,weather_code,is_day,uv_index&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=4"
             aqi_url = f"{API_ENDPOINTS['aqi']}?latitude={lat}&longitude={lon}&current=european_aqi&timezone=auto"
             w_data = net.get_json(weather_url)
             a_data = net.get_json(aqi_url)
@@ -1583,8 +1583,6 @@ def widget_weather(img, draw, col, weather, aqi, location_label=''):
 
     cur = weather['current']
     temp = cur.get('temperature_2m', 0)
-    hum = cur.get('relative_humidity_2m', 0)
-    pres = cur.get('surface_pressure', 0)
     w_code = cur.get('weather_code', 0)
     wind_dir = cur.get('wind_direction_10m', 0)
     wind_spd = cur.get('wind_speed_10m', 0)
@@ -1593,24 +1591,24 @@ def widget_weather(img, draw, col, weather, aqi, location_label=''):
 
     # --- Row A: current conditions ---
     draw_icon(img, x, 20, get_weather_icon(w_code, is_day), (84, 84), THEME['accent'])
-    draw.text((x + 96, 4), f"{math.floor(temp + 0.5)}°C", font=FONTS['80'], fill=THEME['fg'])
-    draw.text((x + 96, 92), f"Humidity: {hum}%", font=FONTS['20'], fill=THEME['muted'])
-    draw.text((x + 96, 114), f"Press: {pres} hPa", font=FONTS['20'], fill=THEME['muted'])
+    draw.text((x + 96, 24), f"{math.floor(temp + 0.5)}°C", font=FONTS['96'], fill=THEME['fg'])
 
+    # UV stacked at the right edge: the label sits above the number rather than
+    # beside it, so a two-digit UV can't crowd the (now much wider) temperature.
     uv_rounded = math.floor(uv_index + 0.5)
     uv_str = str(uv_rounded)
-    draw.text((x + 336, 24), "UV", font=FONTS['20'], fill=THEME['muted'])
+    draw_text_right(draw, right, 4, "UV", FONTS['20'], THEME['muted'])
     uv_w, _ = text_size(draw, uv_str, FONTS['60'])
     uv_x = right - uv_w
     if uv_rounded >= 6:
-        draw_badge(draw, uv_x, 20, uv_str, FONTS['60'], THEME['warn'])
+        draw_badge(draw, uv_x, 32, uv_str, FONTS['60'], THEME['warn'])
     else:
-        draw.text((uv_x, 20), uv_str, font=FONTS['60'], fill=THEME['fg'])
+        draw.text((uv_x, 32), uv_str, font=FONTS['60'], fill=THEME['fg'])
 
-    # City name, right-aligned under the UV reading (clear of the humidity text
-    # on the left). Kept to the city alone so it never runs into it.
+    # City name, right-aligned below the UV reading and clear of the
+    # temperature's descender band. Kept to the city alone so it never runs in.
     if city:
-        draw_text_right(draw, right, 96, city[:16], FONTS['20'], THEME['muted'])
+        draw_text_right(draw, right, 102, city[:16], FONTS['20'], THEME['muted'])
 
     hline(draw, x, right, 130)
 
@@ -1659,27 +1657,40 @@ def widget_weather(img, draw, col, weather, aqi, location_label=''):
 
     hline(draw, x, right, 306)
 
-    # --- Row C: 4-hour forecast ---
-    hourly = weather.get('hourly', {})
-    times = hourly.get('time', [])
-    temps = hourly.get('temperature_2m', [])
-    codes = hourly.get('weather_code', [])
+    # --- Row C: 4-day forecast ---
+    daily = weather.get('daily', {})
+    days = daily.get('time', [])
+    d_codes = daily.get('weather_code', [])
+    d_max = daily.get('temperature_2m_max', [])
+    d_min = daily.get('temperature_2m_min', [])
 
-    cur_iso = datetime.now().strftime("%Y-%m-%dT%H:00")
-    try:
-        start_idx = times.index(cur_iso) + 1
-    except ValueError:
-        start_idx = 0
+    # Card fill for "today": halfway between the background and the rule colour,
+    # so it reads as a raised tile in both the dark and light themes.
+    card = tuple((b + l) // 2 for b, l in zip(THEME['bg'], THEME['line']))
+    today = datetime.now().strftime("%Y-%m-%d")
 
     slot_w = (right - x) // 4
-    for i in range(4):
-        idx = start_idx + i
-        if idx >= len(times):
-            break
+    for i in range(min(4, len(days), len(d_codes), len(d_max), len(d_min))):
         off_x = x + i * slot_w
-        draw.text((off_x + 6, 318), times[idx].split('T')[1][:5], font=FONTS['24'], fill=THEME['muted'])
-        draw_icon(img, off_x + 14, 348, get_weather_icon(codes[idx], 1), (48, 48), THEME['fg'])
-        draw.text((off_x + 6, 398), f"{math.floor(temps[idx] + 0.5)}°C", font=FONTS['24'], fill=THEME['fg'])
+        mid_x = off_x + slot_w // 2
+
+        if days[i] == today:
+            draw.rounded_rectangle((off_x + 2, 314, off_x + slot_w - 2, 422),
+                                   radius=10, fill=card)
+
+        name = datetime.strptime(days[i], "%Y-%m-%d").strftime("%a")
+        draw_text_center(draw, mid_x, 320, name, FONTS['24'],
+                         THEME['fg'] if i == 0 else THEME['muted'])
+        draw_icon(img, mid_x - 24, 350, get_weather_icon(d_codes[i], 1), (48, 48), THEME['fg'])
+
+        hi = f"{math.floor(d_max[i] + 0.5)}°"
+        lo = f"{math.floor(d_min[i] + 0.5)}°"
+        hi_w, _ = text_size(draw, hi, FONTS['24'])
+        lo_w, _ = text_size(draw, lo, FONTS['20'])
+        gap = 8
+        t_x = mid_x - (hi_w + gap + lo_w) // 2
+        draw.text((t_x, 398), hi, font=FONTS['24'], fill=THEME['fg'])
+        draw.text((t_x + hi_w + gap, 402), lo, font=FONTS['20'], fill=THEME['muted'])
 
 
 def widget_clock_panel(img, draw, col, dt, gmail_unread, updated_at):
@@ -1888,6 +1899,7 @@ def load_fonts():
         '40': load('Aldrich-Regular.ttc', 40),
         '60': load('Aldrich-Regular.ttc', 60),
         '80': load('Aldrich-Regular.ttc', 80),
+        '96': load('Aldrich-Regular.ttc', 96),
         'clock': load('advanced_led_board-7.ttc', 170),
         'ss_clock': load('advanced_led_board-7.ttc', 96),  # screensaver clock
         'cjk': load_cjk(30),
