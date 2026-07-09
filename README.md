@@ -1,157 +1,193 @@
 # Pi Ultrawide LCD Dashboard
 
-A fully functional dashboard running on a Raspberry Pi. Designed for the **GeeekPi 11.26" 1920x440 HDMI LCD** (capacitive touch), this project aggregates essential daily information and smart home status into a clean, minimalist interface.
+An always-on information dashboard for the **GeeekPi 11.26" 1920x440 HDMI LCD** (capacitive touch), driven by a Raspberry Pi Zero 2W. Weather, markets, now-playing, AI usage, mail and a clock — in four columns across an ultrawide bar panel.
 
-> **Migrated from e-paper.** This dashboard previously drove a Waveshare 10.85" SPI e-Paper HAT (1360x480, 1-bit). It now renders in full colour to an ordinary HDMI panel via pygame/SDL. See [Migrating from the e-paper build](#migrating-from-the-e-paper-build).
+![The dashboard running on the GeeekPi 11.26" panel](docs/dashboard.png)
 
-## Key Features
+## Credits
 
-* **Ultrawide 4-column layout:** Tuned for the panel's 1920x440 letterbox aspect.
-* **Full colour + light/dark themes:** Values are colour-coded (green / amber / red) by severity instead of the old 1-bit black-on-white.
-* **Capacitive touch:** Tap anywhere to force an immediate data refresh; press and hold to toggle the light/dark theme.
-* **(NEW!) Antigravity usage data:** Displays usage data for Antigravity, showing the limit, and limit reset time.
-* **Claude Code usage data:** Displays usage data for Claude Code, showing the daily limit, weekly limit, and limit reset time.
-* **Weather & Air Quality:** Real-time temperature, wind direction/speed, UV index, 4-day forecast (weekday, condition icon, high/low — today's card highlighted), and AQI (with visual inversion for high pollution levels) using the Open-Meteo API. **Location** is resolved in priority order (first that succeeds wins): `LOCATION_ZIP` (a postal code, resolved via zippopotam.us — most precise; Open-Meteo's own geocoder can't do ZIPs), then `LOCATION_CITY` (a place name geocoded via Open-Meteo, e.g. `'Santa Clara, CA'`), then public-IP geolocation if `USE_IP_LOCATION` is on (follows the Pi to new networks automatically, but a VPN/ISP can misplace it), then the hardcoded `LOCATION_LAT/LON` fallback. Ships unpinned (`LOCATION_ZIP = ''`, `USE_IP_LOCATION = True`) so it follows the Pi; to pin it, set `LOCATION_ZIP` in `main.py`, or better, set it on-screen (hold 5s → Settings → Zip Code), which saves to the gitignored `settings.json` and keeps your location out of the repo. The resolved place is shown on the weather panel.
-* **Strava Integration:** Displays total and yearly activity statistics (distance and ride counts), including specific breakdowns for biking and hiking.
-* **Bambu Lab 3D Printer:** Live monitoring of print status, completion percentage, remaining time, and current layer progress.
-* **Roborock Vacuum:** Live battery level, current status, and tracking for cleaned area during active cleaning.
-* **Spotify:** Displays the currently playing track and artist.
-* **Gmail:** Tracks the number of unread emails in your primary inbox.
-* **Markets widget:** BTC, S&P 500, and gold (US $/oz), each with its daily % change, in column 1's lower slot. Data comes from Yahoo Finance (no API key). Column 1's upper slot shows the Bambu Lab 3D printer (below); other columns fall back to Ping / Time-progress demos when their integrations are off.
-* **Optimized Rendering:** A frame is only drawn when something visible actually changes (the clock minute, a data update, a touch, or a theme switch). The event loop stays at 30 Hz so touch remains responsive without burning CPU on redundant redraws.
+This project is a fork of **[czuryk/Waveshare-ePaper-10.85-dashboard](https://github.com/czuryk/Waveshare-ePaper-10.85-dashboard)** by **czuryk** (Mike Sevbo) — an e-ink dashboard for the Waveshare 10.85" e-Paper HAT+. The widget set, the integrations (Strava, Bambu Lab, Roborock, Spotify, Gmail, weather) and the overall design are his work. All credit for the original concept and implementation goes to him.
 
-<img width="2400" height="1792" alt="dashboard_primary" src="https://github.com/user-attachments/assets/20be2eae-4a06-48e2-9ad4-efcba00dcb7f" />
-<img width="2400" height="1792" alt="dashboard_fallback" src="https://github.com/user-attachments/assets/158d65ee-9a12-4f09-a9d3-ea66ca3055bc" />
+This fork ports it from **1-bit e-paper to a full-colour HDMI LCD**, which changed the renderer, the geometry, and the refresh model. See [Changes from the e-paper original](#changes-from-the-e-paper-original).
+
+> The upstream repository does not publish a LICENSE file. Please check with the original author before redistributing.
 
 ---
 
-## Prerequisites & Installation
+## What's on the dashboard
 
-### Hardware
-* Raspberry Pi Zero 2W (tested), with a **mini-HDMI → HDMI** adapter
+Four columns, left to right, exactly as pictured above.
+
+### Column 1 — Printer & Markets
+
+* **Bambu Lab 3D printer** *(top)* — live print status, completion percentage, time remaining and current layer. Reads local MQTT over your LAN; shows `PRINTER: OFFLINE` when the printer is powered down or unreachable.
+* **Markets** *(bottom)* — BTC, S&P 500 and gold (US $/oz), each with its daily % change, coloured green/red. Data from Yahoo Finance; no API key needed.
+
+### Column 2 — Now Playing & AI usage
+
+* **Bluetooth now-playing** *(top)* — pair your phone (the Pi advertises as `Pi_Dashboard`) and it shows the current track, artist, elapsed/total time and a progress bar, read over BlueZ AVRCP while the phone plays from any app. Tap the on-screen ⏮ ⏯ ⏭ buttons to control playback. No audio backend — only the metadata rides the AVRCP control channel. Song and artist render with Noto Sans CJK, so non-Latin names display correctly.
+* **Claude AI usage** *(bottom)* — your 5-hour and 7-day limits as percentages with reset countdowns and progress bars.
+
+### Column 3 — Weather & Air Quality
+
+* **Current conditions** — large temperature, a condition icon, the UV index (highlighted amber at 6+) and the resolved location name.
+* **Wind** — a compass rose with a direction arrow and speed in km/h.
+* **Air quality** — European AQI, coloured green / white / red by severity, inverted into a filled badge when it's high.
+* **4-day forecast** — weekday, condition icon and high/low for each of the next four days, with today's card highlighted.
+
+Data comes from [Open-Meteo](https://open-meteo.com/) (no API key). Location resolves in priority order — ZIP code, then city name, then public-IP geolocation, then a hardcoded lat/lon fallback. See [Set your location](#1-set-your-location-zip-code).
+
+### Column 4 — Clock, Mail & Status
+
+* **Clock** — a large seven-segment time readout, plus date and weekday.
+* **Gmail** — unread count for your primary inbox, with the envelope icon highlighted when mail is waiting.
+* **Status footer** — last data refresh, the Pi's IP address, and a reminder of the touch gestures.
+
+### Screen behaviour
+
+* **Tap** anywhere — force an immediate refetch of all data (rate-limited to once per 15 s).
+* **Press & hold ~1.2 s** — toggle the light / dark theme.
+* **Press & hold 5 s** — open the on-screen [Settings menu](#the-on-screen-settings-menu).
+* **Screensaver** — after 10 minutes idle the dashboard is replaced by a drifting clock on black; the next touch brings it straight back. Tune with `SCREENSAVER_SECONDS` in `main.py` (`0` disables it).
+
+---
+
+## Optional widgets (disabled by default)
+
+These are inherited from the original project and are switched off in `main.py`. Each takes the slot of the widget listed, so enabling one *replaces* what's currently shown there.
+
+| Widget | Flag | Takes the slot of | What it shows |
+| --- | --- | --- | --- |
+| **Strava** | `ENABLE_STRAVA` | Bambu printer (col 1 top) | Total and yearly distance and ride counts, split by bike / hike |
+| **Roborock** | `ENABLE_ROBOROCK` | Now-playing (col 2 top) | Vacuum battery, status, and area cleaned during a run |
+| **Antigravity** | `ENABLE_ANTIGRAVITY` | Now-playing (col 2 top) | Antigravity usage limit and reset time |
+| **Spotify** (via Last.fm) | `ENABLE_SPOTIFY` | Claude usage (col 2 bottom) | Currently playing track and artist |
+
+Where two widgets compete for a slot the first one wins: `ENABLE_ROBOROCK` beats `ENABLE_ANTIGRAVITY` beats the now-playing widget, and `ENABLE_CLAUDE` beats `ENABLE_SPOTIFY`. So to see Spotify you must also set `ENABLE_CLAUDE = False`.
+
+If both `ENABLE_CLAUDE` and `ENABLE_SPOTIFY` are off, column 2's lower slot falls back to a **time-progress** widget (day / month / year elapsed). With everything off the dashboard boots into that fallback set and needs no credentials at all.
+
+Setup for these lives in [Optional integrations](#optional-integrations).
+
+---
+
+## Hardware
+
+* Raspberry Pi Zero 2W (tested) with a **mini-HDMI → HDMI** adapter
 * [GeeekPi 11.26" 1920x440 HDMI LCD, capacitive touch](https://wiki.52pi.com/index.php/11.26-inch-1920x440-Capacitive-Touch-Screen)
-* HDMI cable + USB cable (the USB link carries the touch panel, which enumerates as a standard USB HID touchscreen — no driver needed)
+* HDMI cable + USB cable — the USB link carries the touch panel, which enumerates as a standard USB HID touchscreen, no driver needed
+* microSD card, 8 GB or larger
 
-**Use a Raspberry Pi OS _Lite_ (64-bit, console-only) image.** A "with desktop" image runs its own Wayland compositor (`labwc`) that holds the screen and fights `cage` for it, so the dashboard never appears. If you must use a desktop image, switch the Pi to boot to console with `sudo systemctl set-default multi-user.target`.
+---
 
-### 1. System Setup
-SPI is **no longer required** — the panel is a plain HDMI display.
+## Setup
 
-> ⚠️ **Do not force an HDMI mode.** The panel advertises its native 1920x440 over EDID. Adding `hdmi_timings`/`hdmi_mode` to `config.txt`, or `video=HDMI-A-1:…` to `cmdline.txt`, gives a **black screen**. Let KMS pick the EDID mode and remove any such override you may have added.
+### 1. Flash the OS and get on WiFi
 
-Verify the mode the Pi actually picked:
+Use **Raspberry Pi OS _Lite_ (64-bit)** — the console-only image.
 
-`fbset -s` — you should see `1920x440`.
+> ⚠️ Do **not** use a "with desktop" image. It runs its own Wayland compositor (`labwc`) which holds the screen and fights `cage` for it, so the dashboard never appears. If you must, switch the Pi to boot to console: `sudo systemctl set-default multi-user.target`.
 
-Install system dependencies. The dashboard renders through `cage`, a single-app Wayland kiosk compositor, with `seatd` supplying the seat:
+In **Raspberry Pi Imager**, click the gear icon before writing and set:
+
+* **hostname** — e.g. `raspberrypi`
+* **Enable SSH** — with a password or your public key
+* **Configure wireless LAN** — your WiFi SSID, password and country code
+* **username / password** — remember these; the systemd unit assumes `pi`
+
+This is the easiest way to get WiFi working, because the dashboard's own on-screen WiFi setup needs the dashboard to already be running. Once it *is* running you can switch networks from the touchscreen without a keyboard — see [Changing WiFi later](#changing-wifi-later).
+
+Boot the Pi, then SSH in:
+
+```bash
+ssh pi@raspberrypi.local
+```
+
+### 2. Check the display mode
+
+```bash
+fbset -s      # should report 1920x440
+```
+
+> ⚠️ **Do not force an HDMI mode.** The panel advertises 1920x440 over EDID. Adding `hdmi_timings` / `hdmi_mode` to `config.txt`, or `video=HDMI-A-1:…` to `cmdline.txt`, gives a **black screen**. Let KMS pick the EDID mode and remove any such override.
+
+If the panel comes up at another resolution the app scales frames to fit and logs a warning.
+
+### 3. Install system dependencies
+
+The dashboard renders through `cage`, a single-app Wayland kiosk compositor, with `seatd` providing the seat.
 
 ```bash
 sudo apt update
-sudo apt install -y python3-pygame python3-pil python3-requests \
-                    python3-numpy cage seatd git tmux
+sudo apt install -y git \
+    python3-pygame python3-pil python3-requests \
+    cage seatd wlr-randr \
+    python3-dbus-next bluez-tools fonts-noto-cjk
+
 sudo systemctl enable --now seatd
 ```
 
-`seatd` must be enabled explicitly on a Lite image, or `cage` fails with a `libseat`/seat error.
+`seatd` must be enabled explicitly on a Lite image, or `cage` fails with a `libseat` error.
 
-### 2. Python Dependencies
-Bookworm enforces PEP 668, so system packages come from `apt` (above). The remaining pure-Python packages install into a `--user` site or a venv:
+| Package | Why |
+| --- | --- |
+| `python3-pygame`, `python3-pil` | Rendering — Pillow composes the frame, pygame/SDL blits it |
+| `cage`, `seatd`, `wlr-randr` | Kiosk compositor, its seat, and display control |
+| `python3-dbus-next`, `bluez-tools` | Bluetooth now-playing widget and headless pairing |
+| `fonts-noto-cjk` | Chinese / Japanese / Korean song and artist names |
 
-`pip3 install --break-system-packages google-api-python-client google-auth-httplib2 google-auth-oauthlib aiomqtt roborock`
+### 4. Get the code
 
-*Note: `bambulabs_api` library already included in this package.*
-
-### 3. Display Backend
-Rendering lives in `display.py`. It composes each frame with Pillow and blits it through pygame/SDL. Under `cage`, SDL auto-selects its **wayland** driver — the code deliberately does not force one.
-
-> ⚠️ **Do not set `SDL_VIDEODRIVER=kmsdrm`.** It fails to start on this Pi Zero 2W + bar-panel combination. SDL's own auto-detection is correct here; the explicit probe list in `display.py` is only a fallback for other hardware.
-
-Because the app needs a graphical seat, **it cannot be run from a plain SSH session** — start it via systemd (below). For layout checks over SSH, use `--preview`, which needs no display at all.
-
-If the panel comes up at a mode other than 1920x440, frames are scaled to fit and a warning is logged.
-
----
-
-## Configuration & Widget Setup
-
-All widget toggles and API configurations are located at the top of the `main.py` script. You can enable or disable specific widgets using the `ENABLE_*` boolean variables.
-
-> **Headless note.** The Pi runs the dashboard under systemd + cage with no keyboard or browser, so the interactive OAuth flows below **cannot** be done on the Pi. Authenticate on your **desktop** (where a browser and Python are available), then copy the resulting credential file to the Pi and restart the service. This is why the `ENABLE_*` flags must be turned on and authenticated *before* the service is enabled.
-
-### Claude Code
-The Claude usage widget shows your 5-hour and 7-day limits. Auth is a browser OAuth flow that writes `claude_creds.json`.
-
-**On your desktop:**
-1. Set `ENABLE_CLAUDE = True` in `main.py`.
-2. Run the interactive flow directly:
-   ```bash
-   python -c "import claude; claude.interactive_auth()"
-   ```
-3. It prints an authorization URL. Open it, log in with your Claude account, and you'll be redirected to a dead `localhost:18924/callback?code=...` page.
-4. Copy the **full** URL from the address bar and paste it back at the prompt. It writes `claude_creds.json`.
-
-**Then deploy to the Pi:**
 ```bash
-scp claude_creds.json raspberrypi.local:~/Pi_dashboard/
-ssh raspberrypi.local "sudo systemctl restart pi-dashboard"
+git clone https://github.com/xiabo-lab/pi_dashboard.git ~/Pi_dashboard
+cd ~/Pi_dashboard
 ```
-The service runs `claude.py` every 10 minutes to refresh usage; the token self-renews via its refresh token, so this is a one-time step.
 
-### Strava
-1. Go to your Strava API Settings and create an API Application.
-2. Note down your **Client ID** and **Client Secret**.
-3. Run the `main.py` script from the terminal for the first time.
-4. The script will pause, ask for your ID/Secret, and print an authorization URL in the console. 
-5. Open that URL in your browser, click "Authorize", and you will be redirected to a dead `localhost` page.
-6. Copy the `code=...` portion from your browser's address bar and paste it back into the terminal. The script will automatically fetch and save the required `activity:read_all` tokens to `strava_token.json`.
+### 5. Install Python dependencies
 
-### Roborock
-1. Open `main.py` and input your Roborock account email address in the `ROBOROCK_CONF` dictionary.
-2. Run the script from the terminal.
-3. The script will request an OTP (One-Time Password) which will be sent to your email.
-4. Enter the 6-digit code in the terminal. The script will securely save your session data locally.
+Raspberry Pi OS Bookworm enforces PEP 668, so anything not available from `apt` needs `--break-system-packages`:
 
-### Bambu Lab 3D Printer
-**You DON'T need to enable "LAN Mode" on your Bambu Lab printer to access local data.**
-1. On your printer's screen, go to **Settings -> Network**.
-2. Note your printer's **IP Address**, **Serial Number**, and **Access Code**. (Force on your router to map exact IP address)
-3. Copy `device_conf.example.json` to `device_conf.json` and fill in the `printer` block with these local credentials. That file is gitignored, so the credentials stay out of the repo; without it the printer widget simply stays offline.
-
-### Spotify (via Last.fm)
-Since the official Spotify API requires running a local web server for complex token renewals, this dashboard uses Last.fm to fetch the current playing track reliably form Spotify. It's is transparent and working method.
-1. Connect your Spotify account to Last.fm.
-2. Create a Last.fm API account to generate an **API Key**.
-3. Update `LASTFM_CONF` in the script with your API Key and Last.fm Username.
-   
-**After configuration, you no longer need to use the Last.fm service, and a paid Last.fm account is not required. You can continue to use only the Spotify service.**
-
-### Gmail
-The Gmail widget shows your unread inbox count (read-only access). There is no `ENABLE_GMAIL` flag — the widget activates automatically once a valid `token.json` is present. `main.py` only *reads* that token; a one-time helper, `gmail_auth.py`, creates it.
-
-**In the Google Cloud Console (one-time):**
-1. Create a project and enable the **Gmail API**.
-2. Configure the **OAuth consent screen** (External), and under **Test users** add your own Gmail address — otherwise Google returns `access_denied`.
-3. Create an **OAuth 2.0 Client ID** of type **Desktop app**. Download the JSON, rename it to `credentials.json`, and place it next to `gmail_auth.py`.
-
-**On your desktop:**
 ```bash
-pip install google-auth-oauthlib google-api-python-client
-python gmail_auth.py
+pip3 install --break-system-packages paho-mqtt \
+    google-api-python-client google-auth-httplib2 google-auth-oauthlib
 ```
-A browser opens; grant read-only access. It writes `token.json` and prints your unread count to confirm it works.
 
-**Then deploy to the Pi:**
+* `paho-mqtt` — required by the Bambu Lab printer widget.
+* the three `google-*` packages — required by the Gmail widget.
+
+The `bambulabs_api` library is **already bundled** in `lib/`, so there is nothing to install for it.
+
+Only if you plan to enable the Roborock widget:
+
 ```bash
-scp token.json raspberrypi.local:~/Pi_dashboard/
-ssh raspberrypi.local "sudo systemctl restart pi-dashboard"
+pip3 install --break-system-packages roborock aiomqtt
 ```
-The token refreshes itself from then on. `credentials.json` stays on your desktop — the Pi only needs `token.json`.
 
----
+### 6. Bluetooth pairing agent (optional but recommended)
 
-## Running the Dashboard
+Lets the Pi accept "Just Works" pairing with no keyboard:
 
-The dashboard needs a graphical seat (`cage`), so it **cannot** be launched from a plain SSH session — run it from systemd, which also starts it automatically on boot.
+```bash
+sudo cp bt-agent.service /etc/systemd/system/
+sudo systemctl enable --now bt-agent
+```
+
+A phone's AVRCP device otherwise pops a stray mouse cursor onto the screen. This udev rule tells libinput to ignore it:
+
+```bash
+sudo cp 99-pidash-ignore-avrcp-pointer.rules /etc/udev/rules.d/
+sudo udevadm control --reload
+```
+
+### 7. Configure your integrations
+
+Do this **before** enabling the service — the OAuth flows call `input()`, which a systemd service cannot answer. See [Configuration](#configuration) below.
+
+With no configuration at all the dashboard still runs: weather, markets, clock and the Bluetooth widget need no credentials.
+
+### 8. Start it
+
+The dashboard needs a graphical seat, so it **cannot** be launched from a plain SSH session. Run it from systemd, which also starts it on boot.
 
 ```bash
 sudo cp ~/Pi_dashboard/pi-dashboard.service /etc/systemd/system/
@@ -162,16 +198,178 @@ journalctl -u pi-dashboard -f      # watch it start
 
 A healthy start logs `Display ready: 1920x440 via SDL driver 'wayland'`.
 
-> The unit's `ExecStart` hard-codes `/home/pi/Pi_dashboard`. If your Pi user differs, edit the path — otherwise the service restart-loops with `can't open file … No such file or directory`. Check with:
-> `grep ExecStart /etc/systemd/system/pi-dashboard.service`
+> The unit hardcodes `/home/pi/Pi_dashboard`. If your Pi username differs, edit `WorkingDirectory` and `ExecStart` to match — otherwise the service restart-loops with `can't open file … No such file or directory`.
 
-**Authenticate the integrations _before_ enabling the service.** The `auth_*` functions call `input()`, which a systemd service cannot answer — it would fail on every boot. Flip the `ENABLE_*` flags in `main.py`, run `python3 main.py --preview` once interactively to complete each OAuth flow, then enable the service. With all flags `False` (the default) the dashboard boots straight into the fallback widget set and needs no credentials.
-
-To redeploy after a code change:
+After any code change:
 
 ```bash
 sudo systemctl restart pi-dashboard
 ```
+
+---
+
+## Configuration
+
+Widget toggles (`ENABLE_*`) live at the top of `main.py`. Personal credentials do **not** — they live in files that are gitignored, so they never end up in the repository:
+
+| File | Holds | Created by |
+| --- | --- | --- |
+| `device_conf.json` | Bambu printer IP / serial / access code, Roborock email | you, from `device_conf.example.json` |
+| `settings.json` | Weather ZIP code | the on-screen Settings menu |
+| `claude_creds.json` | Claude OAuth token | `claude.interactive_auth()` |
+| `token.json` | Gmail OAuth token | `gmail_auth.py` |
+
+`main.py` reads all of them at runtime. That is why you can safely publish your fork of this repo.
+
+### 1. Set your location (ZIP code)
+
+Easiest, and it keeps your location out of the repo — **hold the screen for 5 seconds → Zip Code**, type it on the numeric keypad, confirm. It's saved to `settings.json` and the weather re-resolves immediately, no restart.
+
+Alternatively, edit `main.py`:
+
+```python
+LOCATION_ZIP = '10001'          # a postal code, resolved via zippopotam.us
+LOCATION_ZIP_COUNTRY = 'us'
+```
+
+The dashboard ships **unpinned** (`LOCATION_ZIP = ''`, `USE_IP_LOCATION = True`), so out of the box the weather follows the Pi's public IP. That's convenient but a VPN or unusual ISP routing can place you in the wrong city — set a ZIP for an exact fix.
+
+### 2. Bambu Lab 3D printer
+
+You do **not** need to enable LAN Mode on the printer.
+
+1. On the printer's screen go to **Settings → Network** and note the **IP address**, **serial number** and **access code**.
+2. Give the printer a static DHCP reservation on your router — otherwise its IP changes and the widget goes offline.
+3. Copy the example config and fill it in:
+
+```bash
+cp device_conf.example.json device_conf.json
+nano device_conf.json
+```
+
+```json
+{
+  "printer": {
+    "IP": "192.168.1.50",
+    "SERIAL": "your-printer-serial",
+    "ACCESS_CODE": "your-lan-access-code"
+  }
+}
+```
+
+4. Ensure `ENABLE_BAMBU = True` in `main.py`, then restart the service.
+
+`device_conf.json` is gitignored. Without it the printer widget simply shows `PRINTER: OFFLINE` rather than crashing.
+
+### 3. Claude account
+
+Shows your Claude Code usage limits. Auth is a browser OAuth flow, so run it **on your desktop**, not the headless Pi.
+
+**On your desktop**, in a copy of this repo:
+
+```bash
+python -c "import claude; claude.interactive_auth()"
+```
+
+1. It prints an authorization URL. Open it and log in with your Claude account.
+2. You'll be redirected to a dead `localhost:18924/callback?code=…` page — that's expected.
+3. Copy the **full** URL from the address bar and paste it back at the prompt.
+4. It writes `claude_creds.json`.
+
+**Then copy it to the Pi:**
+
+```bash
+scp claude_creds.json raspberrypi.local:~/Pi_dashboard/
+ssh raspberrypi.local "sudo systemctl restart pi-dashboard"
+```
+
+Set `ENABLE_CLAUDE = True` in `main.py`. The token self-renews from its refresh token, so this is a one-time step.
+
+### 4. Gmail account
+
+Shows your unread inbox count, read-only. There is no `ENABLE_GMAIL` flag — the widget activates as soon as a valid `token.json` is present.
+
+**In the Google Cloud Console (one-time):**
+
+1. Create a project and enable the **Gmail API**.
+2. Configure the **OAuth consent screen** (type: External). Under **Test users**, add your own Gmail address — skip this and Google returns `access_denied`.
+3. Create an **OAuth 2.0 Client ID** of type **Desktop app**. Download the JSON, rename it to `credentials.json`, and put it next to `gmail_auth.py`.
+
+**On your desktop:**
+
+```bash
+pip install google-auth-oauthlib google-api-python-client
+python gmail_auth.py
+```
+
+A browser opens; grant read-only access. It writes `token.json` and prints your unread count to confirm.
+
+**Then copy it to the Pi:**
+
+```bash
+scp token.json raspberrypi.local:~/Pi_dashboard/
+ssh raspberrypi.local "sudo systemctl restart pi-dashboard"
+```
+
+`credentials.json` stays on your desktop — the Pi only ever needs `token.json`, and it refreshes itself from then on.
+
+### Changing WiFi later
+
+Once the dashboard is running you never need a keyboard again. **Hold the screen for 5 seconds → WiFi**:
+
+* Nearby networks are scanned and listed with signal strength and a lock icon for secured ones.
+* Tap one, type the password on the on-screen keyboard (letters / `?123` symbols / Shift), and tap **Connect**.
+
+It drives `nmcli`, so NetworkManager saves the profile and reconnects on boot. Any stale profile for that SSID is cleared first, so a retry can't fail with `key-mgmt: property is missing`.
+
+---
+
+## The on-screen Settings menu
+
+Hold the screen for **5 seconds** to open it. Five sub-screens, each tile showing a live subtitle (current SSID, paired phone, ZIP, version):
+
+| Screen | What it does |
+| --- | --- |
+| **WiFi** | Scan and join networks with an on-screen keyboard |
+| **Bluetooth** | Pair a new phone (`Pi_Dashboard`), or forget a paired one |
+| **Zip Code** | Numeric keypad for the weather ZIP; applied immediately |
+| **Account** | The connected Claude account (name, plan, email) and Google account |
+| **Firmware** | App version, hostname, IP, current WiFi, Python version, uptime |
+
+`Close` returns to the dashboard. Everything runs as root under the service, so there's no sudo prompt. The menu needs the app running under `cage` — it can't be driven over SSH.
+
+---
+
+## Optional integrations
+
+### Strava
+
+1. Create an API Application in your Strava API settings; note the **Client ID** and **Client Secret**.
+2. Set `ENABLE_STRAVA = True` and run `python3 main.py` from a terminal.
+3. It asks for the ID/secret and prints an authorization URL. Open it, click Authorize, and you'll land on a dead `localhost` page.
+4. Paste the `code=…` value back into the terminal. It saves `activity:read_all` tokens to `strava_token.json`.
+
+### Roborock
+
+1. Put your Roborock account email in the `roborock` block of `device_conf.json`.
+2. Set `ENABLE_ROBOROCK = True` and run `python3 main.py` from a terminal.
+3. It requests a one-time password, emailed to you. Enter the 6-digit code; the session is saved locally.
+
+Needs `pip3 install --break-system-packages roborock aiomqtt`.
+
+### Spotify (via Last.fm)
+
+The official Spotify API needs a local web server for token renewal, so the dashboard reads the current track from Last.fm instead.
+
+1. Connect your Spotify account to Last.fm.
+2. Create a Last.fm API account to get an **API key**.
+3. Fill in `LASTFM_CONF` in `main.py` with the key and your Last.fm username, and set `ENABLE_SPOTIFY = True`.
+
+After setup you don't need to use Last.fm directly, and a paid account isn't required — keep using Spotify as normal.
+
+---
+
+## Reference
 
 ### Command-line options
 
@@ -185,68 +383,40 @@ sudo systemctl restart pi-dashboard
 
 | Gesture | Action |
 | --- | --- |
-| Tap | Force an immediate refetch of all data (rate-limited to once every 15s) |
-| Press & hold (~1.2s) | Toggle light / dark theme |
-| Press & hold **5s** | Open the **Settings menu** (a progress bar fills as you hold) |
-| Tap during the screensaver | Return to the dashboard (this touch only wakes; it does not also refresh/toggle) |
-| `R` / `T` / `S` / `Esc`,`Q` | Refresh / toggle theme / settings / quit (when a keyboard is attached) |
+| Tap | Refetch all data (rate-limited to once per 15 s) |
+| Press & hold ~1.2 s | Toggle light / dark theme |
+| Press & hold 5 s | Open the Settings menu (a progress bar fills as you hold) |
+| Tap during screensaver | Return to the dashboard (wakes only; does not also refresh) |
+| `R` / `T` / `S` / `Esc`,`Q` | Refresh / theme / settings / quit (with a keyboard attached) |
 
-### Bluetooth music widget
+---
 
-Column 2's upper slot shows a **now-playing** widget (`bluetooth_music.py`): pair a phone (the Pi's Bluetooth name is **`Pi_Dashboard`**) and it reads the current track over BlueZ AVRCP — song, artist, play/pause, and a live progress bar — while the phone plays from YouTube Music (or any app). No audio backend is needed: the metadata rides the AVRCP control channel, which the Pi connects explicitly. Adapted from the sibling [carlyrics](https://github.com/xiabo-lab) project. Song/artist render with Noto Sans CJK (`fonts-noto-cjk`) so non-Latin names show. Tap the on-screen prev / play-pause / next controls to drive playback. Pair via **Settings → Bluetooth → Pair New Phone**. Requires `python3-dbus-next` and `bluez-tools` (bt-agent, deployed as `bt-agent.service` for headless "Just Works" pairing). A phone's AVRCP device otherwise pops a mouse cursor on screen; `99-pidash-ignore-avrcp-pointer.rules` (copy to `/etc/udev/rules.d/`) tells libinput to ignore it.
+## How it works
 
-### Settings menu (on-screen, no keyboard needed)
+* **Asynchronous data fetching.** Each service (weather, printer, markets, Claude, Gmail…) is polled by its own background thread at its own interval. A slow API or a dropped connection in one never blocks the others or freezes the UI.
+* **Change-driven rendering.** The main loop polls touch at 30 Hz but only composes and blits a frame when something visible changes. Every data write bumps a revision counter; the renderer compares `(clock minute, revision, theme, dim state)` against the last frame and skips the redraw if they match. An idle screen costs almost nothing.
 
-Hold the screen for **5 seconds** to open Settings — useful for changes when you can't SSH in. It's a full-screen menu (`settings.py`, rendered with Pillow) with five sub-screens; each tile shows a live subtitle (current SSID, paired phone, ZIP, version):
+**Initial population is deliberately slow.** On first launch widgets show placeholders or zeros and fill in over a few minutes. Initial requests are staggered on purpose — it avoids a CPU spike, spares the Pi's network stack, and respects the upstream APIs' rate limits.
 
-* **WiFi** — scan nearby networks (signal % + lock icon for secured), tap one, type the password on an **on-screen keyboard** (letters / `?123` symbols / Shift), and **Connect**. Uses `nmcli`, so NetworkManager saves it and reconnects on boot. Before each connect it clears any stale/partial saved profile for that SSID (matched by SSID, not profile name) so a retry can't fail with `key-mgmt: property is missing`. (Lives in `wifi_setup.py`.)
-* **Bluetooth** — Pair New Phone (makes the adapter discoverable as `Pi_Dashboard`), and a list of paired phones each with a Forget button.
-* **Zip Code** — a numeric keypad to set the weather ZIP. Saved to `settings.json` (which overrides the code default on startup) and applied immediately — the weather re-resolves without a restart.
-* **Account** — shows the connected **Claude** account (name + plan + email, via the OAuth profile endpoint) and **Google** account (Gmail address).
-* **Firmware** — app version, hostname, IP, current WiFi, Python version, uptime.
+### Why a moving clock instead of switching the panel off
 
-`Close` returns to the dashboard. Everything runs as root under the service, so no sudo prompt; the settings menu (like WiFi) requires the app to be running under `cage` (it can't be driven over SSH).
+This GeeekPi LCD exposes **no backlight control** (`/sys/class/backlight` is empty), ignores `vcgencmd display_power` under KMS, and **does not support HDMI-CEC** (it NACKs CEC commands). Cutting the HDMI signal with `wlr-randr --off` doesn't sleep it either — it just shows a "No Signal" OSD with the backlight still lit.
 
-### Screensaver (idle)
+So there is no software way to turn this panel's backlight off. The drifting clock is the best available option: it avoids the OSD and prevents burn-in from static content, though the backlight stays on. For true power-off you'd need a hardware switch — a smart plug or GPIO relay — on the panel's power.
 
-After `SCREENSAVER_SECONDS` (default **600** = 10 min) with no touch, the dashboard is replaced by a **moving-clock screensaver** — a time / day / date block drifting and bouncing on a black background — and the first touch returns to the dashboard. **The dashboard keeps running underneath**, so it repaints instantly with fresh data on touch. Set `SCREENSAVER_SECONDS = 0` to keep the dashboard on permanently.
+If `wlr-randr` or the touch device isn't found the screensaver disables itself and the screen simply stays on. It can never get stuck dark.
 
-Why a moving clock rather than actually powering the panel off: this GeeekPi LCD exposes **no backlight control** (`/sys/class/backlight` is empty), ignores `vcgencmd display_power` under KMS, and **does not support HDMI-CEC** (it NACKs CEC commands). Cutting the HDMI signal (`wlr-randr --off`) doesn't put it to sleep either — it just shows a "No Signal" OSD with the backlight still lit. So there is no software way to turn this panel's backlight off; the drifting clock is the best available option — it avoids the OSD and prevents burn-in from static content, though the backlight stays on. For true power-off you'd need a hardware switch (smart plug / GPIO relay) on the panel's power.
+---
 
-> This needs `wlr-randr` (`sudo apt install wlr-randr`) and the app running under `cage` as root (both already true for the systemd unit). If `wlr-randr` or the touch device isn't found, the feature disables itself and the screen simply stays on — it will never get stuck dark.
+## Changes from the e-paper original
 
-## How It Works
+If you're coming from [the Waveshare 10.85" build](https://github.com/czuryk/Waveshare-ePaper-10.85-dashboard):
 
-The dashboard is built on a robust, multi-threaded architecture designed to keep the UI responsive and prevent hardware lockups.
+* **`display.py` replaces the e-paper driver.** The `epd10in85` driver, its `.so` blobs and the SPI setup are no longer imported by anything. They live in `Reference/waveshare_epd/`, off the import path, for rollback — delete `Reference/` once you're happy with the LCD.
+* **Geometry changed** from 1360x480 to 1920x440. The panel is 560 px wider but 40 px shorter, so the layout went from 3 columns to 4 and each column's vertical budget tightened.
+* **Colour replaces 1-bit.** Icons load as alpha masks and are painted in whatever colour the theme specifies, so the same `icons/*.bmp` files are reused unmodified. Album art stays full-colour RGB instead of being dithered.
+* **The `signal.SIGALRM` hardware watchdog is gone.** It existed to recover from the e-paper's SPI busy-wait hangs; an HDMI blit cannot hang that way.
+* **The 60-second refresh floor is gone.** That was an e-ink hardware constraint, not a design choice.
+* **New in this fork:** the Bluetooth now-playing widget, the on-screen settings menu (WiFi / Bluetooth / ZIP / account / firmware), the moving-clock screensaver, and the light theme.
 
-* **Asynchronous Data Fetching:** Instead of fetching all data sequentially, the script spawns dedicated background threads. Each service (Weather, Strava, Roborock, Bambu Lab, etc.) pulls data asynchronously at its own specific interval. This ensures that a slow API response or a temporary network drop from one service will never block the others or freeze the system.
-* **Change-Driven Rendering:** The main loop polls for touch at 30 Hz but only composes and blits a frame when the visible state changes. Every data write bumps a revision counter on the shared store; the renderer compares `(clock minute, revision, theme, dim state)` against the last frame and skips the redraw when they match. On an unchanged screen the loop costs almost nothing.
-
-**Important Notes:**
-
-* **Initial Data Population Delay:** When you first launch the script, you will notice that the widgets may show placeholders or zeros, and the full array of data takes a few minutes to completely appear on the screen. This is an intentional design choice to stagger initial network requests. It prevents sudden spikes in CPU usage, avoids overwhelming the Raspberry Pi's network stack, and respects the rate limits of the external APIs.
-* **Panel burn-in / backlight life:** LCDs do not ghost like e-paper, but a static dashboard left on around the clock can cause image retention. The idle **screensaver** described above (moving clock after 10 min, tune `SCREENSAVER_SECONDS`) prevents that. It can't reduce backlight hours, though — this panel has no software backlight/power control (see that section).
-
-## Migrating from the e-paper build
-
-If you are coming from the Waveshare 10.85" version:
-
-* **`display.py` replaces the old e-paper driver.** The `epd10in85` driver, its `.so` blobs, and the SPI setup are no longer imported by anything. They've been moved to `Reference/waveshare_epd/` (off the import path) for rollback; delete `Reference/` once you are happy with the LCD.
-* **Geometry changed** from 1360x480 to 1920x440. The panel is 560px wider but 40px shorter, so the layout moved from 3 columns to 4 (activity/finance · home & AI usage · weather · clock/mail/status) and each column's vertical budget was tightened.
-* **Colour replaces 1-bit.** Icons are now loaded as alpha masks and painted in whatever colour the theme specifies, so the same `icons/*.bmp` files are reused unmodified. Mask polarity is detected per icon (most are dark-on-light, but `icon_wifi.bmp` ships light-on-dark). Spotify album art is kept as full-colour RGB instead of being dithered to 1-bit.
-* **`signal.SIGALRM` hardware watchdog removed.** It existed to recover from the e-paper's SPI busy-wait hangs; an HDMI blit cannot hang that way.
-* **Refresh cadence removed.** The old 60-second floor was an e-ink hardware constraint, not a design choice.
-
-## The 3d printed case
-
-The case below was designed for the Waveshare 10.85" panel and does **not** fit the GeeekPi 11.26" LCD. It is kept here for reference for anyone still running the e-paper build.
-
-You can download the case stl files [here](https://makerworld.com/en/models/2322517-epaper-dashboard-waveshare-10-85).
-
-## Video assembly guide
-
-Assembly guide for the original e-paper build:
-
-[![Video Title](https://img.youtube.com/vi/H964RpaJvu0/0.jpg)](https://youtu.be/H964RpaJvu0)
-(Youtube clickable)
-
+The 3D-printed case and assembly video from the original project were designed for the Waveshare panel and do not fit this one, so they aren't reproduced here — see the [upstream repository](https://github.com/czuryk/Waveshare-ePaper-10.85-dashboard) if you're building the e-paper version.
