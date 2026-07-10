@@ -32,6 +32,17 @@ USER_AGENT = "claude-code/2.0.32"
 log = logging.getLogger(__name__)
 
 
+class ReauthRequired(Exception):
+    """The refresh token is dead - only a browser login can recover.
+
+    Refresh tokens are single-use and rotate on every refresh. If a second copy
+    of claude_creds.json (e.g. one left on a dev box after an scp) replays an
+    already-consumed refresh token, the provider revokes the whole token family:
+    the access token starts 401-ing even though expiresAt is still in the future.
+    Keep the credentials on one machine only.
+    """
+
+
 def _setup_logging():
     """Configure file+console logging. Called only when run as a script, not on
     import - importing this module (e.g. for fetch_profile / interactive_auth)
@@ -77,9 +88,13 @@ def token_is_expired(creds: dict) -> bool:
     return now_ms >= (expires_at - REFRESH_BUFFER_SEC * 1000)
 
 
-def interactive_auth() -> bool:
-    """Interactive authorization flow for the main script setup."""
-    if load_credentials():
+def interactive_auth(force: bool = False) -> bool:
+    """Interactive authorization flow for the main script setup.
+
+    force=True re-authorizes even when a credentials file already exists, which
+    is the only way back from a revoked token (`claude.py --reauth`).
+    """
+    if not force and load_credentials():
         return True
 
     verifier, challenge = generate_pkce()
@@ -173,6 +188,12 @@ def refresh_access_token(creds: dict) -> dict | None:
         resp = requests.post(TOKEN_URL, json=payload, timeout=15)
         if resp.status_code != 200:
             log.error(f"Token refresh failed: {resp.status_code} {resp.text}")
+            try:
+                dead = resp.json().get("error") == "invalid_grant"
+            except ValueError:
+                dead = False
+            if dead:
+                raise ReauthRequired("refresh token rejected (invalid_grant)")
             return None
         data = resp.json()
         creds["accessToken"] = data.get("access_token")
@@ -220,10 +241,13 @@ def fetch_profile() -> dict | None:
     creds = load_credentials()
     if not creds:
         return None
-    if token_is_expired(creds):
-        creds = refresh_access_token(creds)
-        if not creds:
-            return None
+    try:
+        if token_is_expired(creds):
+            creds = refresh_access_token(creds)
+            if not creds:
+                return None
+    except ReauthRequired:
+        return None
 
     headers = {
         "Authorization": f"Bearer {creds.get('accessToken')}",
@@ -249,7 +273,7 @@ def fetch_profile() -> dict | None:
             "email": acct.get("email", ""),
             "plan": plan,
         }
-    except requests.RequestException:
+    except (requests.RequestException, ReauthRequired):
         return None
 
 
@@ -270,29 +294,62 @@ def save_usage(raw: dict):
     USAGE_FILE.write_text(json.dumps(output, indent=2))
 
 
+def write_error(kind: str):
+    """Record a failure in usage.json.
+
+    A transient failure (network down, rate limited) keeps the last good numbers
+    and just flags them stale - blanking the widget over one dropped request is
+    worse than showing figures a few minutes old. Only an auth failure, which
+    nothing but a browser login can clear, replaces the data outright.
+    """
+    if kind == "transient":
+        try:
+            prev = json.loads(USAGE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            prev = {}
+        if "five_hour" in prev:
+            prev["stale"] = True
+            USAGE_FILE.write_text(json.dumps(prev, indent=2))
+            return
+        if prev.get("error") == "reauth_required":
+            return      # a dropped request tells us nothing; the token is still dead
+    USAGE_FILE.write_text(json.dumps({"error": kind}, indent=2))
+
+
 def main():
     _setup_logging()
+    if "--reauth" in sys.argv[1:]:
+        sys.exit(0 if interactive_auth(force=True) else 1)
+
     creds = load_credentials()
     if not creds:
         log.error("No credentials. Run main script to authenticate first.")
+        write_error("reauth_required")
         sys.exit(1)
 
-    if token_is_expired(creds):
-        creds = refresh_access_token(creds)
-        if not creds:
-            USAGE_FILE.write_text(json.dumps({"error": "token_refresh_failed"}, indent=2))
-            sys.exit(1)
+    try:
+        if token_is_expired(creds):
+            creds = refresh_access_token(creds)
+            if not creds:
+                write_error("transient")
+                sys.exit(1)
 
-    raw = fetch_usage(creds.get("accessToken"))
-    if raw is None:
-        creds = refresh_access_token(creds)
-        if creds:
-            raw = fetch_usage(creds.get("accessToken"))
+        raw = fetch_usage(creds.get("accessToken"))
+        if raw is None:
+            # A 401 on a token that still looks unexpired means it was revoked;
+            # the refresh below tells us whether the whole family is dead.
+            creds = refresh_access_token(creds)
+            if creds:
+                raw = fetch_usage(creds.get("accessToken"))
+    except ReauthRequired:
+        log.error("Refresh token rejected - run: python3 claude.py --reauth")
+        write_error("reauth_required")
+        sys.exit(1)
 
     if raw:
         save_usage(raw)
     else:
-        USAGE_FILE.write_text(json.dumps({"error": "fetch_failed"}, indent=2))
+        write_error("transient")
 
 
 if __name__ == "__main__":

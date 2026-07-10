@@ -7,8 +7,11 @@ Opened by a 5-second press (see main.py). Presents a menu of sub-screens:
 
     WiFi      - scan/connect to a network (reuses wifi_setup.WifiSetup)
     Zip Code  - set the ZIP used for weather, via a numeric keypad
-    Account   - show the connected Claude and Google account names
-    Firmware  - app version + system info
+    Account   - connected Claude/Google accounts; Edit opens Bambu Printer,
+                a keyboard screen for the printer IP / access code / serial
+    Firmware  - app version + system info, plus two +/- steppers (applied live
+                and persisted): the screensaver idle timeout and, when an HC-SR04
+                is connected, the proximity sensor's wake distance
 
 Everything is drawn with Pillow (same pipeline as the dashboard) and driven by
 taps hit-tested against rectangles rebuilt each render, in the 1920x440 design
@@ -18,6 +21,15 @@ the menu's Close returns 'exit' to leave settings entirely.
 `ctx` carries the hooks into main.py:
     ctx['current_zip']   -> str            current ZIP
     ctx['apply_zip'](s)                     persist + re-resolve a new ZIP
+    ctx['current_printer'] -> {IP,SERIAL,ACCESS_CODE}
+    ctx['apply_printer'](ip, serial, code) -> bool   persist + reconnect
+    ctx['current_sensor_cm'] -> int          proximity wake distance
+    ctx['apply_sensor_cm'](cm) -> int        persist + apply live, returns stored
+    ctx['sensor_available']  -> bool         HC-SR04 present?
+    ctx['sensor_bounds']     -> (min, max, step)
+    ctx['current_screensaver_min'] -> int    screensaver idle timeout, minutes
+    ctx['apply_screensaver_min'](m) -> int   persist + apply live, returns stored
+    ctx['screensaver_bounds'] -> (min, max, step)
     ctx['app_version']   -> str
     ctx['fetch_claude']  -> {name,email,plan} | None
     ctx['fetch_google']  -> email str | None
@@ -146,8 +158,8 @@ class AccountInfo:
 
     def handle_tap(self, x, y):
         for x0, y0, x1, y1, a in self._hits:
-            if x0 <= x <= x1 and y0 <= y <= y1 and a == 'back':
-                return 'back'
+            if x0 <= x <= x1 and y0 <= y <= y1 and a in ('back', 'printer'):
+                return a
         return None
 
     def render(self):
@@ -177,9 +189,144 @@ class AccountInfo:
         else:
             d.text((260, 212), "Not connected", font=self.f['28'], fill=self.t['muted'])
 
+        # Bambu printer block - credentials live in device_conf.json, edited on
+        # the PrinterSetup sub-screen.
+        conf = self.ctx['current_printer']()
+        d.text((40, 310), "Bambu Printer", font=self.f['28'], fill=self.t['accent'])
+        if conf.get('IP'):
+            d.text((260, 304), conf['IP'], font=self.f['32'], fill=self.t['fg'])
+        else:
+            d.text((260, 312), "Not configured", font=self.f['28'], fill=self.t['muted'])
+        draw_button(d, self.f, self.t, (700, 300, 900, 352), "Edit", 'printer',
+                    self._hits, 'accent')
+
         draw_button(d, self.f, self.t, (self.w // 2 - 120, self.h - 62,
                                         self.w // 2 + 120, self.h - 14),
                     "Back", 'back', self._hits)
+        return img
+
+
+class PrinterSetup:
+    """Edit the Bambu printer's IP / Access Code / Serial.
+
+    Three fields down the left, on-screen keyboard down the right. Tap a field
+    to aim the keyboard at it; Save writes device_conf.json via ctx and kicks
+    the printer thread into reconnecting.
+    """
+
+    _FIELDS = [('IP', 'IP Address', 15),
+               ('ACCESS_CODE', 'Access Code', 8),
+               ('SERIAL', 'S/N', 20)]
+
+    # Keyboard rows: (label, action, width in key-units). 10 units per row.
+    _ROWS = [
+        [(c, c, 1.0) for c in '1234567890'],
+        [(c, c, 1.0) for c in 'QWERTYUIOP'],
+        [(c, c, 1.0) for c in 'ASDFGHJKL'] + [('.', '.', 1.0)],
+        [('aA', 'case', 1.5)] + [(c, c, 1.0) for c in 'ZXCVBNM'] + [('Del', 'del', 1.5)],
+    ]
+
+    def __init__(self, fonts, theme, w, h, ctx):
+        self.f, self.t, self.w, self.h, self.ctx = fonts, theme, w, h, ctx
+        conf = ctx['current_printer']()
+        self.values = {k: str(conf.get(k, '') or '') for k, _l, _m in self._FIELDS}
+        self.focus = 'IP'
+        self.upper = True
+        self.status = None      # ('Saved', ok) | ('...', alert)
+        self.dirty = True
+        self.animating = False
+        self._hits = []
+
+    def _hit(self, x, y):
+        for x0, y0, x1, y1, a in self._hits:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return a
+        return None
+
+    def _maxlen(self):
+        return next(m for k, _l, m in self._FIELDS if k == self.focus)
+
+    def _valid(self):
+        return all(self.values[k].strip() for k, _l, _m in self._FIELDS)
+
+    def handle_tap(self, x, y):
+        act = self._hit(x, y)
+        if act is None:
+            return None
+        self.dirty = True
+        if act == 'back':
+            return 'back'
+        if act == 'save':
+            if self._valid():
+                ok = self.ctx['apply_printer'](self.values['IP'], self.values['SERIAL'],
+                                               self.values['ACCESS_CODE'])
+                self.status = ("Saved - reconnecting", 'ok') if ok else ("Save failed", 'alert')
+            else:
+                self.status = ("Fill in all three fields", 'alert')
+            return None
+        if act.startswith('field:'):
+            self.focus = act[6:]
+            return None
+        if act == 'case':
+            self.upper = not self.upper
+            return None
+
+        cur = self.values[self.focus]
+        if act == 'del':
+            self.values[self.focus] = cur[:-1]
+        elif act == 'clear':
+            self.values[self.focus] = ''
+        else:
+            ch = act if act.isdigit() or act == '.' else (act.upper() if self.upper
+                                                          else act.lower())
+            if self.focus == 'IP' and not (ch.isdigit() or ch == '.'):
+                return None          # letters can't appear in a v4 address
+            if len(cur) < self._maxlen():
+                self.values[self.focus] = cur + ch
+        self.status = None
+        return None
+
+    def render(self):
+        self._hits = []
+        img = Image.new('RGB', (self.w, self.h), self.t['bg'])
+        d = ImageDraw.Draw(img)
+        d.text((24, 12), "Bambu Printer", font=self.f['35'], fill=self.t['fg'])
+
+        # --- fields, left column ---
+        for i, (key, label, _m) in enumerate(self._FIELDS):
+            y = 80 + i * 76
+            focused = key == self.focus
+            d.text((24, y + 14), label, font=self.f['24'], fill=self.t['muted'])
+            d.rounded_rectangle((230, y, 700, y + 56), radius=8,
+                                outline=self.t['accent'] if focused else self.t['muted'],
+                                width=2 if focused else 1)
+            text = self.values[key] + ("|" if focused else "")
+            d.text((246, y + 12), text, font=self.f['28'], fill=self.t['fg'])
+            self._hits.append((230, y, 700, y + 56, f'field:{key}'))
+
+        # --- buttons + status, under the fields ---
+        draw_button(d, self.f, self.t, (24, 320, 240, 376), "Save", 'save', self._hits, 'ok')
+        draw_button(d, self.f, self.t, (256, 320, 472, 376), "Clear", 'clear', self._hits, 'accent')
+        draw_button(d, self.f, self.t, (488, 320, 700, 376), "Back", 'back', self._hits)
+        if self.status:
+            msg, kind = self.status
+            d.text((24, 390), msg, font=self.f['24'], fill=self.t[kind])
+
+        # --- keyboard, right column ---
+        kx, ky, kw_total = 736, 56, self.w - 24 - 736
+        g, kh = 10, 84
+        unit = (kw_total - 9 * g) / 10.0
+        for r, row in enumerate(self._ROWS):
+            x = kx
+            y0 = ky + r * (kh + g)
+            for label, act, units in row:
+                x1 = x + unit * units + g * (units - 1)
+                if act.isalpha() and len(act) == 1:
+                    label = act.upper() if self.upper else act.lower()
+                kind = 'accent' if act in ('del', 'case') else 'normal'
+                draw_button(d, self.f, self.t, (x, y0, x1, y0 + kh),
+                            label, act, self._hits, kind)
+                x = x1 + g
         return img
 
 
@@ -267,7 +414,7 @@ class BluetoothScreen:
 
 
 class FirmwareInfo:
-    """App version and system info."""
+    """App version/system info, plus editable screensaver timeout + wake distance."""
 
     def __init__(self, fonts, theme, w, h, ctx):
         self.f, self.t, self.w, self.h, self.ctx = fonts, theme, w, h, ctx
@@ -275,6 +422,17 @@ class FirmwareInfo:
         self.animating = False
         self._hits = []
         self.rows = self._gather()
+
+        # Screensaver idle timeout (minutes) - always editable.
+        self.ss_lo, self.ss_hi, self.ss_step = ctx.get('screensaver_bounds', (1, 60, 1))
+        self.ss_pending = int(ctx['current_screensaver_min']())
+        self.ss_saved = self.ss_pending
+
+        # Proximity wake distance (cm) - editable only when the sensor is present.
+        self.lo, self.hi, self.step = ctx.get('sensor_bounds', (5, 200, 5))
+        self.sensor_ok = ctx['sensor_available']()
+        self.pending = int(ctx['current_sensor_cm']())  # value being edited
+        self.saved = self.pending                        # last persisted value
 
     def _gather(self):
         try:
@@ -300,10 +458,34 @@ class FirmwareInfo:
             ("Uptime", up),
         ]
 
-    def handle_tap(self, x, y):
+    def _hit(self, x, y):
         for x0, y0, x1, y1, a in self._hits:
-            if x0 <= x <= x1 and y0 <= y <= y1 and a == 'back':
-                return 'back'
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return a
+        return None
+
+    def handle_tap(self, x, y):
+        act = self._hit(x, y)
+        if act is None:
+            return None
+        self.dirty = True
+        if act == 'back':
+            return 'back'
+        # Screensaver timeout stepper (ss_) and wake distance stepper (sn_).
+        if act == 'ss_minus':
+            self.ss_pending = max(self.ss_lo, self.ss_pending - self.ss_step)
+        elif act == 'ss_plus':
+            self.ss_pending = min(self.ss_hi, self.ss_pending + self.ss_step)
+        elif act == 'ss_save':
+            self.ss_saved = self.ss_pending = int(
+                self.ctx['apply_screensaver_min'](self.ss_pending))
+        elif act == 'sn_minus':
+            self.pending = max(self.lo, self.pending - self.step)
+        elif act == 'sn_plus':
+            self.pending = min(self.hi, self.pending + self.step)
+        elif act == 'sn_save':
+            # apply_sensor_cm clamps/rounds and returns the value actually stored.
+            self.saved = self.pending = int(self.ctx['apply_sensor_cm'](self.pending))
         return None
 
     def render(self):
@@ -317,10 +499,54 @@ class FirmwareInfo:
             d.text((40, y), f"{k}:", font=self.f['24'], fill=self.t['muted'])
             d.text((240, y), str(v), font=self.f['24'], fill=self.t['fg'])
             y += 42
+
+        # Right column: two stepper controls, screensaver on top of wake sensor.
+        ss_status = (f"Active: after {self.ss_saved} min idle"
+                     if self.ss_pending == self.ss_saved
+                     else f"Tap Save to apply (active: {self.ss_saved} min)")
+        self._stepper(d, 56, "Screensaver Timeout", "Start screensaver after idle:",
+                      f"{self.ss_pending} min", 'ss_',
+                      ss_status, self.ss_pending == self.ss_saved)
+
+        if self.sensor_ok:
+            sn_status = (f"Active: waking within {self.saved} cm"
+                         if self.pending == self.saved
+                         else f"Tap Save to apply (active: {self.saved} cm)")
+            self._stepper(d, 222, "Screen Wake Sensor", "Wake when object is within:",
+                          f"{self.pending} cm", 'sn_',
+                          sn_status, self.pending == self.saved)
+        else:
+            d.text((760, 222), "Screen Wake Sensor", font=self.f['28'], fill=self.t['accent'])
+            d.text((760, 262), "No sensor detected (HC-SR04 not connected)",
+                   font=self.f['20'], fill=self.t['muted'])
+
         draw_button(d, self.f, self.t, (self.w - 260, self.h - 62,
                                         self.w - 24, self.h - 14),
                     "Back", 'back', self._hits)
         return img
+
+    def _stepper(self, d, y, title, hint, value_text, prefix, status, saved):
+        """One [-] value [+] Save control at top-left (760, y). prefix names the
+        hit actions (e.g. 'ss_' -> ss_minus/ss_plus/ss_save)."""
+        px = 760
+        d.text((px, y), title, font=self.f['28'], fill=self.t['accent'])
+        d.text((px, y + 34), hint, font=self.f['20'], fill=self.t['muted'])
+
+        by0 = y + 62
+        by1 = by0 + 64
+        draw_button(d, self.f, self.t, (px, by0, px + 72, by1), "-",
+                    prefix + 'minus', self._hits, 'accent')
+        d.rounded_rectangle((px + 86, by0, px + 300, by1), radius=8,
+                            outline=self.t['muted'], width=1)
+        _text_center(d, px + 193, (by0 + by1) / 2 - self.f['40'].size / 2,
+                     value_text, self.f['40'], self.t['fg'])
+        draw_button(d, self.f, self.t, (px + 314, by0, px + 386, by1), "+",
+                    prefix + 'plus', self._hits, 'accent')
+        draw_button(d, self.f, self.t, (px + 408, by0, px + 600, by1), "Save",
+                    prefix + 'save', self._hits, 'ok')
+
+        d.text((px, by1 + 8), status, font=self.f['20'],
+               fill=self.t['ok'] if saved else self.t['muted'])
 
 
 # --- top-level menu ---------------------------------------------------------
@@ -332,6 +558,7 @@ class SettingsUI:
     def __init__(self, fonts, theme, w, h, ctx):
         self.f, self.t, self.w, self.h, self.ctx = fonts, theme, w, h, ctx
         self.sub = None
+        self.stack = []      # sub-screens to return to on 'back' (Account -> Printer)
         self._dirty = True
         self._hits = []
 
@@ -362,14 +589,25 @@ class SettingsUI:
             return AccountInfo(self.f, self.t, self.w, self.h, self.ctx)
         if key == 'firmware':
             return FirmwareInfo(self.f, self.t, self.w, self.h, self.ctx)
+        if key == 'printer':
+            return PrinterSetup(self.f, self.t, self.w, self.h, self.ctx)
         return None
 
     def handle_tap(self, x, y):
         """Returns 'exit' to close settings, else None."""
         if self.sub is not None:
-            if self.sub.handle_tap(x, y) == 'back':
-                self.sub = None
+            res = self.sub.handle_tap(x, y)
+            if res == 'back':
+                self.sub = self.stack.pop() if self.stack else None
                 self._dirty = True
+                if self.sub:
+                    self.sub.dirty = True
+            elif res is not None:
+                # A sub-screen asked to open another one (Account -> Printer).
+                nxt = self._make(res)
+                if nxt:
+                    self.stack.append(self.sub)
+                    self.sub = nxt
             return None
         for x0, y0, x1, y1, act in self._hits:
             if x0 <= x <= x1 and y0 <= y <= y1:

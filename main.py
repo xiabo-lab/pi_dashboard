@@ -89,13 +89,37 @@ TAP_REFRESH_COOLDOWN = 15
 # returns to the dashboard. This panel can't be powered off in software - it has
 # no backlight control and no CEC, and cutting the HDMI signal just makes it show
 # a "No Signal" OSD - so we keep the signal on and drift the clock to avoid
-# burn-in. The dashboard keeps running underneath. Set 0 to disable.
+# burn-in. The dashboard keeps running underneath. Set 0 to disable. This is the
+# code default; the Firmware settings screen can override it (persisted to
+# settings.json, applied live) within the minute bounds below.
 SCREENSAVER_SECONDS = 600    # 10 minutes
 SCREENSAVER_FRAME_S = 0.1    # screensaver redraw interval (~10 fps drift)
+SCREENSAVER_MIN_MINUTES = 1
+SCREENSAVER_MAX_MINUTES = 60
+SCREENSAVER_STEP_MINUTES = 1
 
 # After waking, ignore tap/hold *actions* for this long so the touch that woke
 # the screen doesn't also refresh data or flip the theme.
 WAKE_GUARD_SECONDS = 1.5
+
+# Optional HC-SR04 ultrasonic sensor: a second wake source alongside touch, so
+# walking up to the panel dismisses the screensaver without reaching for it. It
+# fires on *entering* range, so a wall or a chair parked inside the threshold
+# neither wakes the screen nor holds the screensaver off. Pins are BCM numbers;
+# see proximity.py for the wiring, including the mandatory ECHO voltage divider.
+# With the sensor unplugged (or gpiozero absent) the dashboard is unchanged.
+PROXIMITY_ENABLED = True
+PROXIMITY_TRIGGER_PIN = 23   # header pin 16
+PROXIMITY_ECHO_PIN = 24      # header pin 18, via a 1k/2k divider
+# 20cm, not 100: with nobody in front, this sensor's noise floor scatters around
+# 30-50cm, so a 100cm threshold woke on clutter. A real approach reads <15cm,
+# well clear of the noise, so 20cm fires only on a genuine close approach. This
+# is the code default; the Firmware settings screen can override it (persisted
+# to settings.json, applied live) within the bounds below, in 5cm steps.
+PROXIMITY_WAKE_CM = 20
+PROXIMITY_WAKE_MIN_CM = 5
+PROXIMITY_WAKE_MAX_CM = 200
+PROXIMITY_WAKE_STEP_CM = 5
 
 # --- API ENDPOINTS ---
 API_ENDPOINTS = {
@@ -186,6 +210,7 @@ import display as display_backend
 import wifi_setup
 import settings as settings_ui
 import bluetooth_music
+import proximity
 
 try:
     import bambulabs_api as bl
@@ -215,6 +240,10 @@ logger.addHandler(file_handler)
 
 icon_cache = {}
 global_printer = None
+# Set when the settings menu rewrites PRINTER_CONF; update_data_thread owns the
+# Printer object, so it does the disconnect/rebuild rather than the UI thread.
+printer_reinit = threading.Event()
+global_sensor = None   # proximity.ProximitySensor once main() creates it
 bt = None  # bluetooth_music.BtMusic instance (created in main())
 
 
@@ -520,9 +549,34 @@ def geocode_zip(zipcode, country='us'):
 
 
 # --- RUNTIME SETTINGS (on-screen editable, persisted to settings.json) ---
+def _save_settings(patch):
+    """Merge `patch` into settings.json, preserving the other keys. -> bool.
+
+    Read-modify-write rather than a bare dump so saving one setting (e.g. the
+    ZIP) never wipes another (e.g. the sensor distance)."""
+    conf = {}
+    try:
+        with open(SETTINGS_FILE) as f:
+            conf = json.load(f)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logging.error(f"Failed to read settings.json: {e}")
+    if not isinstance(conf, dict):
+        conf = {}
+    conf.update(patch)
+    try:
+        with open(SETTINGS_FILE, 'w') as f:
+            json.dump(conf, f)
+        return True
+    except Exception as e:
+        logging.error(f"Failed to write settings.json: {e}")
+        return False
+
+
 def load_runtime_settings():
     """Apply any settings saved from the on-screen menu over the code defaults."""
-    global LOCATION_ZIP
+    global LOCATION_ZIP, PROXIMITY_WAKE_CM, SCREENSAVER_SECONDS
     try:
         with open(SETTINGS_FILE) as f:
             s = json.load(f)
@@ -530,6 +584,14 @@ def load_runtime_settings():
         if isinstance(z, str) and z.strip():
             LOCATION_ZIP = z.strip()
             logging.info(f"Loaded ZIP from settings: {LOCATION_ZIP}")
+        cm = s.get('sensor_wake_cm')
+        if isinstance(cm, (int, float)):
+            PROXIMITY_WAKE_CM = _clamp_wake_cm(cm)
+            logging.info(f"Loaded sensor wake distance from settings: {PROXIMITY_WAKE_CM}cm")
+        mins = s.get('screensaver_minutes')
+        if isinstance(mins, (int, float)):
+            SCREENSAVER_SECONDS = _clamp_screensaver_min(mins) * 60
+            logging.info(f"Loaded screensaver timeout from settings: {SCREENSAVER_SECONDS // 60}min")
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -540,15 +602,69 @@ def apply_zip(new_zip):
     """Set the weather ZIP from the on-screen menu, persist it, and re-resolve."""
     global LOCATION_ZIP
     LOCATION_ZIP = str(new_zip).strip()
-    try:
-        with open(SETTINGS_FILE, 'w') as f:
-            json.dump({'zip': LOCATION_ZIP}, f)
-    except Exception as e:
-        logging.error(f"Failed to write settings.json: {e}")
+    _save_settings({'zip': LOCATION_ZIP})
     with data_store.lock:
         data_store.last_update['geo'] = 0      # force location re-resolve
         data_store.last_update['weather'] = 0  # and an immediate weather refetch
     logging.info(f"ZIP set to {LOCATION_ZIP}")
+
+
+def _clamp_wake_cm(cm):
+    """Round to the nearest 5cm step and clamp to the allowed range. -> int."""
+    cm = int(round(float(cm) / PROXIMITY_WAKE_STEP_CM) * PROXIMITY_WAKE_STEP_CM)
+    return max(PROXIMITY_WAKE_MIN_CM, min(PROXIMITY_WAKE_MAX_CM, cm))
+
+
+def _clamp_screensaver_min(mins):
+    """Clamp the screensaver timeout to the allowed minute range. -> int."""
+    return max(SCREENSAVER_MIN_MINUTES, min(SCREENSAVER_MAX_MINUTES, int(round(float(mins)))))
+
+
+def apply_screensaver_min(new_min):
+    """Set the screensaver idle timeout from the menu, persist it, apply it live."""
+    global SCREENSAVER_SECONDS
+    mins = _clamp_screensaver_min(new_min)
+    SCREENSAVER_SECONDS = mins * 60   # the main loop reads this global each frame
+    _save_settings({'screensaver_minutes': mins})
+    logging.info(f"Screensaver timeout set to {mins}min")
+    return mins
+
+
+def apply_sensor_cm(new_cm):
+    """Set the proximity wake distance from the menu, persist it, apply it live."""
+    global PROXIMITY_WAKE_CM
+    PROXIMITY_WAKE_CM = _clamp_wake_cm(new_cm)
+    _save_settings({'sensor_wake_cm': PROXIMITY_WAKE_CM})
+    if global_sensor is not None:
+        global_sensor.set_threshold(PROXIMITY_WAKE_CM)
+    logging.info(f"Sensor wake distance set to {PROXIMITY_WAKE_CM}cm")
+    return PROXIMITY_WAKE_CM
+
+
+def apply_printer_conf(ip, serial, access_code):
+    """Persist Bambu credentials from the on-screen menu and reconnect. -> bool"""
+    PRINTER_CONF.update({'IP': ip.strip(), 'SERIAL': serial.strip(),
+                         'ACCESS_CODE': access_code.strip()})
+    conf = {}
+    try:
+        with open(DEVICE_CONF_FILE) as f:
+            conf = json.load(f)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logging.error(f"Failed to read {DEVICE_CONF_FILE}: {e}")
+    if not isinstance(conf, dict):
+        conf = {}
+    conf['printer'] = dict(PRINTER_CONF)   # leaves roborock and friends intact
+    try:
+        with open(DEVICE_CONF_FILE, 'w') as f:
+            json.dump(conf, f, indent=2)
+    except Exception as e:
+        logging.error(f"Failed to write {DEVICE_CONF_FILE}: {e}")
+        return False
+    printer_reinit.set()
+    logging.info(f"Printer set to {PRINTER_CONF['IP']}")
+    return True
 
 
 def fetch_claude_profile():
@@ -565,6 +681,17 @@ def build_settings_ctx():
     return {
         'current_zip': lambda: LOCATION_ZIP,
         'apply_zip': apply_zip,
+        'current_printer': lambda: dict(PRINTER_CONF),
+        'apply_printer': apply_printer_conf,
+        'current_sensor_cm': lambda: PROXIMITY_WAKE_CM,
+        'apply_sensor_cm': apply_sensor_cm,
+        'sensor_available': lambda: bool(global_sensor and global_sensor.available),
+        'sensor_bounds': (PROXIMITY_WAKE_MIN_CM, PROXIMITY_WAKE_MAX_CM,
+                          PROXIMITY_WAKE_STEP_CM),
+        'current_screensaver_min': lambda: SCREENSAVER_SECONDS // 60,
+        'apply_screensaver_min': apply_screensaver_min,
+        'screensaver_bounds': (SCREENSAVER_MIN_MINUTES, SCREENSAVER_MAX_MINUTES,
+                               SCREENSAVER_STEP_MINUTES),
         'app_version': APP_VERSION,
         'fetch_claude': fetch_claude_profile,
         'fetch_google': fetch_google_email,
@@ -908,12 +1035,16 @@ def roborock_update_thread(user_data, email):
 def update_data_thread():
     global global_printer
 
-    if ENABLE_BAMBU:
+    def _init_printer():
+        global global_printer
         try:
             global_printer = bl.Printer(PRINTER_CONF['IP'], PRINTER_CONF['ACCESS_CODE'], PRINTER_CONF['SERIAL'])
         except Exception as e:
             logging.error(f"Bambu init error: {e}")
             global_printer = None
+
+    if ENABLE_BAMBU:
+        _init_printer()
 
     is_connected = False
 
@@ -984,6 +1115,18 @@ def update_data_thread():
                 data_store.last_update['sysload'] = now
 
         if ENABLE_BAMBU:
+            # Credentials changed in Settings -> Account -> Bambu Printer.
+            if printer_reinit.is_set():
+                printer_reinit.clear()
+                if global_printer:
+                    try:
+                        global_printer.disconnect()
+                    except Exception:
+                        pass
+                _init_printer()
+                is_connected = False
+                data_store.last_update['printer'] = 0
+
             update_interval = 5 if is_connected else 15
             if now - data_store.last_update['printer'] > update_interval:
                 is_alive = ping_printer(PRINTER_CONF['IP'])
@@ -1088,10 +1231,12 @@ def update_data_thread():
                         usage_data = json.load(f)
                     with data_store.lock:
                         data_store.claude = usage_data
-                        if "error" in usage_data and "five_hour" not in usage_data:
-                            data_store.claude['error'] = True
-                        else:
-                            data_store.claude['error'] = False
+                        # claude.py reports 'reauth_required' (dead token, needs a
+                        # browser login) or 'transient' (network/rate limit, last
+                        # good numbers kept and flagged stale).
+                        kind = usage_data.get('error') if 'five_hour' not in usage_data else None
+                        data_store.claude['error'] = bool(kind)
+                        data_store.claude['error_kind'] = kind
                         data_store.bump()
                 else:
                     with data_store.lock:
@@ -1530,9 +1675,15 @@ def widget_music(img, draw, x, y, music):
 
 def widget_claude(img, draw, x, y, claude):
     draw.text((x, y), "CLAUDE AI USAGE", font=FONTS['28'], fill=THEME['fg'])
+    if claude.get('stale'):
+        draw.text((x + 260, y + 6), "stale", font=FONTS['20'], fill=THEME['muted'])
 
     if claude.get('error'):
-        draw.text((x, y + 50), "Claude Usage Error", font=FONTS['24'], fill=THEME['alert'])
+        if claude.get('error_kind') == 'reauth_required':
+            draw.text((x, y + 44), "Sign-in expired", font=FONTS['24'], fill=THEME['alert'])
+            draw.text((x, y + 76), "run: claude.py --reauth", font=FONTS['20'], fill=THEME['muted'])
+        else:
+            draw.text((x, y + 50), "Claude Usage Error", font=FONTS['24'], fill=THEME['alert'])
         return
 
     pct_5h = claude.get('five_hour', {}).get('utilization', 0)
@@ -1985,13 +2136,32 @@ def main():
     # Idle -> moving-clock screensaver (see SCREENSAVER_SECONDS). `activity['t']`
     # (monotonic) is bumped by touches; ScreenPower is kept only for its kernel
     # touch reader, which feeds note_activity as a backup to pygame's events.
-    activity = {'t': time.monotonic()}
+    # The proximity sensor is a third feed: bumping the timer is all it takes to
+    # wake, since the loop leaves the screensaver as soon as it stops being idle.
+    # `by_touch` records what bumped it last, so the wake guard below can tell a
+    # touch-wake (which must swallow the touch that caused it) from a proximity
+    # wake (which has no touch to swallow).
+    activity = {'t': time.monotonic(), 'by_touch': True}
 
     def note_activity():
         activity['t'] = time.monotonic()
+        activity['by_touch'] = True
+
+    def note_proximity():
+        activity['t'] = time.monotonic()
+        activity['by_touch'] = False
 
     power = display_backend.ScreenPower(on_activity=note_activity)
     power.start()
+
+    global global_sensor
+    sensor = None
+    if PROXIMITY_ENABLED:
+        sensor = proximity.ProximitySensor(
+            PROXIMITY_TRIGGER_PIN, PROXIMITY_ECHO_PIN,
+            threshold_cm=PROXIMITY_WAKE_CM, on_detect=note_proximity)
+        global_sensor = sensor   # lets the settings menu retune it live
+        sensor.start()
 
     start_threads(roborock_user_data)
 
@@ -2081,7 +2251,9 @@ def main():
                 ss_last = 0.0
             elif not idle and saver:
                 saver = False
-                wake_time = now_m      # guard the pygame touch that follows
+                # Guard the pygame touch that follows a touch-wake. A proximity
+                # wake has no such touch, so don't make the user tap twice.
+                wake_time = now_m if activity['by_touch'] else 0.0
                 last_key = None        # repaint the dashboard
 
             if saver:
@@ -2139,6 +2311,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if sensor is not None:
+            sensor.close()
         screen.close()
 
 
