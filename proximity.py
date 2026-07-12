@@ -173,13 +173,18 @@ class ProximitySensor:
         reads.sort()
         return reads[len(reads) // 2]
 
-    def _fire(self, cm):
-        """Fire on_detect if the refire gap has elapsed. Returns True if it did."""
+    def _fire(self, cm, log=True):
+        """Fire on_detect if the refire gap has elapsed. Returns True if it did.
+
+        `log` is suppressed for the repeated keep-awake fires in level mode, so a
+        stationary target that legitimately holds the screen on doesn't also
+        flood the log (and rotate real errors out of it) every refire_gap_s."""
         now = time.monotonic()
         if now - self._last_fire < self.refire_gap_s:
             return False
         self._last_fire = now
-        logging.info("Proximity: object at %.0fcm, waking screen", cm)
+        if log:
+            logging.info("Proximity: object at %.0fcm, waking screen", cm)
         if self.on_detect:
             self.on_detect()
         return True
@@ -187,9 +192,15 @@ class ProximitySensor:
     def _update(self, cm):
         """Fold one distance into the near/far state. Returns True if it fired."""
         if self.trigger_mode == 'level':
-            # Any reading within threshold wakes, rate-limited by refire_gap_s.
+            # Any reading within threshold keeps the screen awake, rate-limited
+            # by refire_gap_s. Log only on the far->near *entry*, not on every
+            # refire while the target stays put - otherwise a mug or a chair
+            # parked inside the threshold writes a line every couple of seconds.
+            was_near = self._near
             self._near = cm <= self.threshold_cm
-            return self._fire(cm) if self._near else False
+            if not self._near:
+                return False
+            return self._fire(cm, log=was_near is not True)
 
         # --- 'edge' mode: fire only on a confirmed far->near transition ---
         # Between threshold and release the reading is ambiguous; keep whatever

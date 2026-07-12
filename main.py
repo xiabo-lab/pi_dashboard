@@ -107,6 +107,15 @@ AUTO_RESTART_HOUR = 6          # 24h clock; the reboot fires at HH:00
 AUTO_RESTART_MIN_HOUR = 0
 AUTO_RESTART_MAX_HOUR = 23
 
+# Data-thread watchdog. update_data_thread fetches every widget sequentially in
+# one thread, and some calls (Bambu MQTT, Gmail httplib2) have no hard timeout -
+# after a Wi-Fi flap a socket can be left half-open and block forever, freezing
+# *all* widgets at a fixed time while the clock keeps ticking. The thread bumps a
+# heartbeat once per loop; if that goes stale past this many seconds the process
+# is re-exec'd to recover, instead of sitting frozen for hours. Must comfortably
+# exceed the slowest healthy iteration (claude.py subprocess is capped at 30s).
+DATA_WATCHDOG_TIMEOUT_S = 180
+
 # After waking, ignore tap/hold *actions* for this long so the touch that woke
 # the screen doesn't also refresh data or flip the theme.
 WAKE_GUARD_SECONDS = 1.5
@@ -137,7 +146,10 @@ PROXIMITY_WAKE_STEP_CM = 5
 # 'level' suits a sensor glued to the panel where people stop right in front.
 PROXIMITY_TRIGGER_MODE = 'level'
 # Seconds between measurements. Also the worst-case wake latency in level mode.
-PROXIMITY_POLL_INTERVAL_S = 1.0
+# 3s (not 1s): each ping busy-waits on the echo line holding the GIL, so polling
+# less often frees CPU for the render/data threads at the cost of ~2s more wake
+# latency - fine for a screensaver dismiss.
+PROXIMITY_POLL_INTERVAL_S = 3.0
 
 # --- API ENDPOINTS ---
 API_ENDPOINTS = {
@@ -263,6 +275,9 @@ global_printer = None
 printer_reinit = threading.Event()
 global_sensor = None   # proximity.ProximitySensor once main() creates it
 bt = None  # bluetooth_music.BtMusic instance (created in main())
+# Set by the data watchdog when update_data_thread wedges; the main loop sees it
+# and re-execs from the main thread (a clean spot to tear down SDL/display).
+data_restart_request = threading.Event()
 
 
 # ##############
@@ -370,6 +385,9 @@ class DataStore:
         self.lock = threading.RLock()
         self.rev = 0
         self.updated_at = 0
+        # Bumped at the top of every update_data_thread iteration; the watchdog
+        # re-execs if it stops advancing (a wedged fetch froze the whole thread).
+        self.heartbeat = time.monotonic()
         self.weather = {}
         self.aqi = 0
         # Resolved weather location. Seeded from the configured fallback and
@@ -700,6 +718,35 @@ def auto_restart_thread():
             last_fire_day = now.date()
             logging.warning(f"Scheduled daily restart at {AUTO_RESTART_HOUR:02d}:00")
             reboot_pi()
+
+
+def _reexec(reason):
+    """Replace this process with a fresh copy of itself. Used to recover from an
+    unrecoverable in-process wedge (FD exhaustion, a stuck fetch loop). Keeps the
+    same PID, so the cage compositor keeps managing us and the display returns."""
+    logging.critical(f"Re-executing dashboard: {reason}")
+    logging.shutdown()
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def data_watchdog_thread():
+    """Recover the dashboard if update_data_thread stops making progress.
+
+    A single wedged network call (half-open socket after a Wi-Fi flap, an
+    unresponsive printer MQTT broker) freezes every widget's data at a fixed
+    time. The render thread keeps drawing, so nothing looks crashed - it just
+    goes stale for hours. This catches that: if the fetch loop's heartbeat is
+    older than the timeout, ask the main loop to re-exec."""
+    while True:
+        time.sleep(30)
+        if data_restart_request.is_set():
+            continue
+        stalled = time.monotonic() - data_store.heartbeat
+        if stalled > DATA_WATCHDOG_TIMEOUT_S:
+            logging.critical(
+                f"Data thread stalled {stalled:.0f}s (>{DATA_WATCHDOG_TIMEOUT_S}s); "
+                "requesting restart")
+            data_restart_request.set()
 
 
 def apply_screensaver_min(new_min):
@@ -1138,6 +1185,10 @@ def update_data_thread():
     is_connected = False
 
     while True:
+        # Heartbeat for the watchdog: proof this loop is still turning over. A
+        # fetch that wedges below never lets us come back here, so the heartbeat
+        # goes stale and the watchdog re-execs us.
+        data_store.heartbeat = time.monotonic()
         now = time.time()
 
         # Resolve the weather location before the weather fetch, so the first
@@ -2176,6 +2227,10 @@ def start_threads(roborock_user_data):
     t_data = threading.Thread(target=update_data_thread, daemon=True)
     t_data.start()
 
+    # Watchdog: re-exec if the data thread wedges on a stuck network call so the
+    # dashboard recovers on its own instead of freezing stale for hours.
+    threading.Thread(target=data_watchdog_thread, daemon=True).start()
+
     # Daily auto-restart to shake off the Wi-Fi drop seen after long uptimes.
     threading.Thread(target=auto_restart_thread, daemon=True).start()
 
@@ -2273,6 +2328,15 @@ def main():
         while True:
             force = False
             now_m = time.monotonic()
+
+            # The data watchdog asks for a restart here rather than re-execing
+            # from its own thread, so the display/SDL teardown happens on the
+            # main thread where it started.
+            if data_restart_request.is_set():
+                if sensor is not None:
+                    sensor.close()
+                screen.close()
+                _reexec("data thread watchdog")
 
             for kind, pos in screen.poll():
                 if kind == display_backend.QUIT:
@@ -2392,9 +2456,7 @@ def main():
                         gc.collect()
                 except OSError as e:
                     if e.errno == 24:  # too many open fds - restart clean
-                        logging.critical("FD exhaustion, restarting")
-                        logging.shutdown()
-                        os.execv(sys.executable, ['python3'] + sys.argv)
+                        _reexec("FD exhaustion")
                     logging.error(f"Render error: {e}")
                 except Exception as e:
                     logging.error(f"Unexpected error in main: {e}")
