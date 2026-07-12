@@ -98,6 +98,15 @@ SCREENSAVER_MIN_MINUTES = 1
 SCREENSAVER_MAX_MINUTES = 60
 SCREENSAVER_STEP_MINUTES = 1
 
+# Automatic daily restart. This panel's Pi has been seen to drop its Wi-Fi after
+# many days of uptime; a scheduled reboot at a quiet hour clears it before anyone
+# notices. On by default at 06:00. Both the on/off and the hour are overridable
+# on the Firmware settings screen (persisted to settings.json, applied live).
+AUTO_RESTART_ENABLED = True
+AUTO_RESTART_HOUR = 6          # 24h clock; the reboot fires at HH:00
+AUTO_RESTART_MIN_HOUR = 0
+AUTO_RESTART_MAX_HOUR = 23
+
 # After waking, ignore tap/hold *actions* for this long so the touch that woke
 # the screen doesn't also refresh data or flip the theme.
 WAKE_GUARD_SECONDS = 1.5
@@ -120,6 +129,15 @@ PROXIMITY_WAKE_CM = 20
 PROXIMITY_WAKE_MIN_CM = 5
 PROXIMITY_WAKE_MAX_CM = 200
 PROXIMITY_WAKE_STEP_CM = 5
+# How the sensor decides to wake:
+#   'level' - wake on ANY reading within the distance, even a stationary target
+#             that walks up and stops. More sensitive; may re-wake while present.
+#   'edge'  - wake only on a clean far->near approach (ignores a target already
+#             in range). Needs a clear approach path to the sensor.
+# 'level' suits a sensor glued to the panel where people stop right in front.
+PROXIMITY_TRIGGER_MODE = 'level'
+# Seconds between measurements. Also the worst-case wake latency in level mode.
+PROXIMITY_POLL_INTERVAL_S = 1.0
 
 # --- API ENDPOINTS ---
 API_ENDPOINTS = {
@@ -577,6 +595,7 @@ def _save_settings(patch):
 def load_runtime_settings():
     """Apply any settings saved from the on-screen menu over the code defaults."""
     global LOCATION_ZIP, PROXIMITY_WAKE_CM, SCREENSAVER_SECONDS
+    global AUTO_RESTART_ENABLED, AUTO_RESTART_HOUR
     try:
         with open(SETTINGS_FILE) as f:
             s = json.load(f)
@@ -592,6 +611,14 @@ def load_runtime_settings():
         if isinstance(mins, (int, float)):
             SCREENSAVER_SECONDS = _clamp_screensaver_min(mins) * 60
             logging.info(f"Loaded screensaver timeout from settings: {SCREENSAVER_SECONDS // 60}min")
+        en = s.get('restart_enabled')
+        if isinstance(en, bool):
+            AUTO_RESTART_ENABLED = en
+        hr = s.get('restart_hour')
+        if isinstance(hr, (int, float)):
+            AUTO_RESTART_HOUR = _clamp_restart_hour(hr)
+        logging.info(f"Auto-restart: {'on' if AUTO_RESTART_ENABLED else 'off'} "
+                     f"at {AUTO_RESTART_HOUR:02d}:00")
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -618,6 +645,61 @@ def _clamp_wake_cm(cm):
 def _clamp_screensaver_min(mins):
     """Clamp the screensaver timeout to the allowed minute range. -> int."""
     return max(SCREENSAVER_MIN_MINUTES, min(SCREENSAVER_MAX_MINUTES, int(round(float(mins)))))
+
+
+def _clamp_restart_hour(hour):
+    """Clamp the auto-restart hour to 0-23. -> int."""
+    return max(AUTO_RESTART_MIN_HOUR, min(AUTO_RESTART_MAX_HOUR, int(round(float(hour)))))
+
+
+def apply_restart_enabled(enabled):
+    """Turn the daily auto-restart on/off from the menu, persist it. -> bool."""
+    global AUTO_RESTART_ENABLED
+    AUTO_RESTART_ENABLED = bool(enabled)
+    _save_settings({'restart_enabled': AUTO_RESTART_ENABLED})
+    logging.info(f"Auto-restart {'enabled' if AUTO_RESTART_ENABLED else 'disabled'}")
+    return AUTO_RESTART_ENABLED
+
+
+def apply_restart_hour(new_hour):
+    """Set the daily auto-restart hour from the menu, persist it. -> int."""
+    global AUTO_RESTART_HOUR
+    AUTO_RESTART_HOUR = _clamp_restart_hour(new_hour)
+    _save_settings({'restart_hour': AUTO_RESTART_HOUR})
+    logging.info(f"Auto-restart time set to {AUTO_RESTART_HOUR:02d}:00")
+    return AUTO_RESTART_HOUR
+
+
+def reboot_pi():
+    """Reboot the Pi now (from the Firmware menu or the daily schedule).
+
+    The service runs as root, so a plain reboot suffices; `sudo` is kept only so
+    this still works if the app is ever run under a non-root user with the usual
+    passwordless-sudo the Pi ships with."""
+    logging.warning("Rebooting the Pi")
+    try:
+        subprocess.Popen(['sudo', 'reboot'])
+    except Exception as e:
+        logging.error(f"Reboot failed: {e}")
+
+
+def auto_restart_thread():
+    """Reboot the Pi at AUTO_RESTART_HOUR:00 on each day it's enabled.
+
+    Polls once every 20s and fires at most once per calendar day, so the reboot
+    lands in the target minute without repeating. Reads the globals live, so a
+    change from the settings menu takes effect without a restart of this thread."""
+    last_fire_day = None
+    while True:
+        time.sleep(20)
+        if not AUTO_RESTART_ENABLED:
+            continue
+        now = datetime.now()
+        if (now.hour == AUTO_RESTART_HOUR and now.minute == 0
+                and last_fire_day != now.date()):
+            last_fire_day = now.date()
+            logging.warning(f"Scheduled daily restart at {AUTO_RESTART_HOUR:02d}:00")
+            reboot_pi()
 
 
 def apply_screensaver_min(new_min):
@@ -688,10 +770,17 @@ def build_settings_ctx():
         'sensor_available': lambda: bool(global_sensor and global_sensor.available),
         'sensor_bounds': (PROXIMITY_WAKE_MIN_CM, PROXIMITY_WAKE_MAX_CM,
                           PROXIMITY_WAKE_STEP_CM),
+        'sensor_reading': lambda: (global_sensor.last_cm if global_sensor else None),
         'current_screensaver_min': lambda: SCREENSAVER_SECONDS // 60,
         'apply_screensaver_min': apply_screensaver_min,
         'screensaver_bounds': (SCREENSAVER_MIN_MINUTES, SCREENSAVER_MAX_MINUTES,
                                SCREENSAVER_STEP_MINUTES),
+        'restart_enabled': lambda: AUTO_RESTART_ENABLED,
+        'apply_restart_enabled': apply_restart_enabled,
+        'current_restart_hour': lambda: AUTO_RESTART_HOUR,
+        'apply_restart_hour': apply_restart_hour,
+        'restart_bounds': (AUTO_RESTART_MIN_HOUR, AUTO_RESTART_MAX_HOUR, 1),
+        'reboot_now': reboot_pi,
         'app_version': APP_VERSION,
         'fetch_claude': fetch_claude_profile,
         'fetch_google': fetch_google_email,
@@ -2070,7 +2159,7 @@ def load_fonts():
         '80': load('Aldrich-Regular.ttc', 80),
         '96': load('Aldrich-Regular.ttc', 96),
         'clock': load('advanced_led_board-7.ttc', 170),
-        'ss_clock': load('advanced_led_board-7.ttc', 96),  # screensaver clock
+        'ss_clock': load('advanced_led_board-7.ttc', 192),  # screensaver clock (2x)
         'cjk': load_cjk(30),
         'cjk_sm': load_cjk(23),
     }
@@ -2086,6 +2175,9 @@ def start_threads(roborock_user_data):
 
     t_data = threading.Thread(target=update_data_thread, daemon=True)
     t_data.start()
+
+    # Daily auto-restart to shake off the Wi-Fi drop seen after long uptimes.
+    threading.Thread(target=auto_restart_thread, daemon=True).start()
 
     if ENABLE_ROBOROCK:
         t_robo = threading.Thread(target=roborock_update_thread,
@@ -2159,7 +2251,8 @@ def main():
     if PROXIMITY_ENABLED:
         sensor = proximity.ProximitySensor(
             PROXIMITY_TRIGGER_PIN, PROXIMITY_ECHO_PIN,
-            threshold_cm=PROXIMITY_WAKE_CM, on_detect=note_proximity)
+            threshold_cm=PROXIMITY_WAKE_CM, trigger_mode=PROXIMITY_TRIGGER_MODE,
+            poll_interval_s=PROXIMITY_POLL_INTERVAL_S, on_detect=note_proximity)
         global_sensor = sensor   # lets the settings menu retune it live
         sensor.start()
 

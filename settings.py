@@ -5,13 +5,15 @@ On-screen settings menu for the touchscreen dashboard.
 
 Opened by a 5-second press (see main.py). Presents a menu of sub-screens:
 
-    WiFi      - scan/connect to a network (reuses wifi_setup.WifiSetup)
-    Zip Code  - set the ZIP used for weather, via a numeric keypad
-    Account   - connected Claude/Google accounts; Edit opens Bambu Printer,
-                a keyboard screen for the printer IP / access code / serial
-    Firmware  - app version + system info, plus two +/- steppers (applied live
-                and persisted): the screensaver idle timeout and, when an HC-SR04
-                is connected, the proximity sensor's wake distance
+    WiFi        - scan/connect to a network (reuses wifi_setup.WifiSetup)
+    Zip Code    - set the ZIP used for weather, via a numeric keypad
+    Account     - connected Claude/Google accounts; Edit opens Bambu Printer,
+                  a keyboard screen for the printer IP / access code / serial
+    Screensaver - two +/- steppers (applied live and persisted): the screensaver
+                  idle timeout and, when an HC-SR04 is connected, the proximity
+                  sensor's wake distance (with a live reading)
+    Firmware    - app version + system info, plus the automatic daily-restart
+                  controls (on/off, hour) and a Restart Now button
 
 Everything is drawn with Pillow (same pipeline as the dashboard) and driven by
 taps hit-tested against rectangles rebuilt each render, in the 1920x440 design
@@ -30,6 +32,12 @@ the menu's Close returns 'exit' to leave settings entirely.
     ctx['current_screensaver_min'] -> int    screensaver idle timeout, minutes
     ctx['apply_screensaver_min'](m) -> int   persist + apply live, returns stored
     ctx['screensaver_bounds'] -> (min, max, step)
+    ctx['restart_enabled']   -> bool         daily auto-restart on?
+    ctx['apply_restart_enabled'](b) -> bool  persist + apply, returns stored
+    ctx['current_restart_hour'] -> int       hour (0-23) of the daily restart
+    ctx['apply_restart_hour'](h) -> int      persist + apply, returns stored
+    ctx['restart_bounds']    -> (min, max, step)
+    ctx['reboot_now']()                      reboot the Pi immediately
     ctx['app_version']   -> str
     ctx['fetch_claude']  -> {name,email,plan} | None
     ctx['fetch_google']  -> email str | None
@@ -61,6 +69,50 @@ def draw_button(draw, fonts, theme, rect, label, action, hits, kind='normal'):
     _text_center(draw, (x0 + x1) / 2, (y0 + y1) / 2 - fonts['28'].size / 2,
                  label, fonts['28'], fg)
     hits.append((x0, y0, x1, y1, action))
+
+
+def draw_stepper(d, fonts, theme, hits, px, y, title, hint, value_text, prefix,
+                 status, saved):
+    """One [-] value [+] Save control with a title/hint above and a status line
+    below, drawn at top-left (px, y). `prefix` names the hit actions
+    (e.g. 'ss_' -> ss_minus / ss_plus / ss_save)."""
+    d.text((px, y), title, font=fonts['28'], fill=theme['accent'])
+    d.text((px, y + 34), hint, font=fonts['20'], fill=theme['muted'])
+
+    by0 = y + 62
+    by1 = by0 + 64
+    draw_button(d, fonts, theme, (px, by0, px + 72, by1), "-",
+                prefix + 'minus', hits, 'accent')
+    d.rounded_rectangle((px + 86, by0, px + 300, by1), radius=8,
+                        outline=theme['muted'], width=1)
+    _text_center(d, px + 193, (by0 + by1) / 2 - fonts['40'].size / 2,
+                 value_text, fonts['40'], theme['fg'])
+    draw_button(d, fonts, theme, (px + 314, by0, px + 386, by1), "+",
+                prefix + 'plus', hits, 'accent')
+    draw_button(d, fonts, theme, (px + 408, by0, px + 600, by1), "Save",
+                prefix + 'save', hits, 'ok')
+
+    d.text((px, by1 + 8), status, font=fonts['20'],
+           fill=theme['ok'] if saved else theme['muted'])
+
+
+def draw_live_reading(d, fonts, theme, cm, active_cm, lx, y):
+    """Live HC-SR04 distance box at (lx, y), aligned with a stepper's value row.
+    Green while within active_cm (would wake), grey otherwise."""
+    near = cm is not None and cm <= active_cm
+    value = f"{cm:.0f} cm" if cm is not None else "-- cm"
+
+    d.text((lx, y), "LIVE READING", font=fonts['20'], fill=theme['muted'])
+    by0 = y + 62
+    by1 = by0 + 64
+    d.rounded_rectangle((lx, by0, lx + 260, by1), radius=8,
+                        outline=theme['ok'] if near else theme['muted'],
+                        width=2 if near else 1)
+    _text_center(d, lx + 130, (by0 + by1) / 2 - fonts['40'].size / 2,
+                 value, fonts['40'], theme['ok'] if near else theme['fg'])
+    d.text((lx, by1 + 8),
+           "in range - would wake" if near else "clear",
+           font=fonts['20'], fill=theme['ok'] if near else theme['muted'])
 
 
 # --- sub-screens ------------------------------------------------------------
@@ -413,15 +465,14 @@ class BluetoothScreen:
         return img
 
 
-class FirmwareInfo:
-    """App version/system info, plus editable screensaver timeout + wake distance."""
+class ScreensaverSettings:
+    """Screensaver idle timeout, plus the proximity wake distance when a sensor
+    is present. Two +/- steppers; the wake stepper has a live distance readout."""
 
     def __init__(self, fonts, theme, w, h, ctx):
         self.f, self.t, self.w, self.h, self.ctx = fonts, theme, w, h, ctx
         self.dirty = True
-        self.animating = False
         self._hits = []
-        self.rows = self._gather()
 
         # Screensaver idle timeout (minutes) - always editable.
         self.ss_lo, self.ss_hi, self.ss_step = ctx.get('screensaver_bounds', (1, 60, 1))
@@ -433,6 +484,92 @@ class FirmwareInfo:
         self.sensor_ok = ctx['sensor_available']()
         self.pending = int(ctx['current_sensor_cm']())  # value being edited
         self.saved = self.pending                        # last persisted value
+        # Repaint continuously when a sensor is present, so the live reading
+        # next to the wake stepper keeps updating without needing a tap.
+        self.animating = self.sensor_ok
+
+    def _hit(self, x, y):
+        for x0, y0, x1, y1, a in self._hits:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return a
+        return None
+
+    def handle_tap(self, x, y):
+        act = self._hit(x, y)
+        if act is None:
+            return None
+        self.dirty = True
+        if act == 'back':
+            return 'back'
+        # Screensaver timeout stepper (ss_) and wake distance stepper (sn_).
+        if act == 'ss_minus':
+            self.ss_pending = max(self.ss_lo, self.ss_pending - self.ss_step)
+        elif act == 'ss_plus':
+            self.ss_pending = min(self.ss_hi, self.ss_pending + self.ss_step)
+        elif act == 'ss_save':
+            self.ss_saved = self.ss_pending = int(
+                self.ctx['apply_screensaver_min'](self.ss_pending))
+        elif act == 'sn_minus':
+            self.pending = max(self.lo, self.pending - self.step)
+        elif act == 'sn_plus':
+            self.pending = min(self.hi, self.pending + self.step)
+        elif act == 'sn_save':
+            # apply_sensor_cm clamps/rounds and returns the value actually stored.
+            self.saved = self.pending = int(self.ctx['apply_sensor_cm'](self.pending))
+        return None
+
+    def render(self):
+        self._hits = []
+        img = Image.new('RGB', (self.w, self.h), self.t['bg'])
+        d = ImageDraw.Draw(img)
+        d.text((24, 12), "Screensaver", font=self.f['35'], fill=self.t['fg'])
+
+        ss_status = (f"Active: after {self.ss_saved} min idle"
+                     if self.ss_pending == self.ss_saved
+                     else f"Tap Save to apply (active: {self.ss_saved} min)")
+        draw_stepper(d, self.f, self.t, self._hits, 40, 80,
+                     "Screensaver Timeout", "Start screensaver after idle:",
+                     f"{self.ss_pending} min", 'ss_',
+                     ss_status, self.ss_pending == self.ss_saved)
+
+        if self.sensor_ok:
+            sn_status = (f"Active: waking within {self.saved} cm"
+                         if self.pending == self.saved
+                         else f"Tap Save to apply (active: {self.saved} cm)")
+            draw_stepper(d, self.f, self.t, self._hits, 40, 240,
+                         "Screen Wake Sensor", "Wake when object is within:",
+                         f"{self.pending} cm", 'sn_',
+                         sn_status, self.pending == self.saved)
+            draw_live_reading(d, self.f, self.t, self.ctx['sensor_reading'](),
+                              self.saved, 760, 240)
+        else:
+            d.text((40, 240), "Screen Wake Sensor", font=self.f['28'], fill=self.t['accent'])
+            d.text((40, 280), "No sensor detected (HC-SR04 not connected)",
+                   font=self.f['20'], fill=self.t['muted'])
+
+        draw_button(d, self.f, self.t, (self.w - 260, self.h - 62,
+                                        self.w - 24, self.h - 14),
+                    "Back", 'back', self._hits)
+        return img
+
+
+class FirmwareInfo:
+    """App version/system info, plus the automatic daily-restart controls."""
+
+    def __init__(self, fonts, theme, w, h, ctx):
+        self.f, self.t, self.w, self.h, self.ctx = fonts, theme, w, h, ctx
+        self.dirty = True
+        self.animating = False
+        self._hits = []
+        self.rows = self._gather()
+
+        # Automatic daily restart: on/off + hour (0-23), applied live on Save.
+        self.re_lo, self.re_hi, self.re_step = ctx.get('restart_bounds', (0, 23, 1))
+        self.re_enabled = bool(ctx['restart_enabled']())
+        self.re_pending = int(ctx['current_restart_hour']())
+        self.re_saved = self.re_pending
+        # "Restart Now" asks for a second tap before it actually reboots.
+        self.confirm_reboot = False
 
     def _gather(self):
         try:
@@ -471,21 +608,23 @@ class FirmwareInfo:
         self.dirty = True
         if act == 'back':
             return 'back'
-        # Screensaver timeout stepper (ss_) and wake distance stepper (sn_).
-        if act == 'ss_minus':
-            self.ss_pending = max(self.ss_lo, self.ss_pending - self.ss_step)
-        elif act == 'ss_plus':
-            self.ss_pending = min(self.ss_hi, self.ss_pending + self.ss_step)
-        elif act == 'ss_save':
-            self.ss_saved = self.ss_pending = int(
-                self.ctx['apply_screensaver_min'](self.ss_pending))
-        elif act == 'sn_minus':
-            self.pending = max(self.lo, self.pending - self.step)
-        elif act == 'sn_plus':
-            self.pending = min(self.hi, self.pending + self.step)
-        elif act == 'sn_save':
-            # apply_sensor_cm clamps/rounds and returns the value actually stored.
-            self.saved = self.pending = int(self.ctx['apply_sensor_cm'](self.pending))
+        # Restart Now is a two-tap confirm; any other tap cancels a pending one.
+        if act == 'reboot_now':
+            if self.confirm_reboot:
+                self.ctx['reboot_now']()
+            else:
+                self.confirm_reboot = True
+            return None
+        self.confirm_reboot = False
+        if act == 're_toggle':
+            self.re_enabled = bool(self.ctx['apply_restart_enabled'](not self.re_enabled))
+        elif act == 're_minus':
+            self.re_pending = max(self.re_lo, self.re_pending - self.re_step)
+        elif act == 're_plus':
+            self.re_pending = min(self.re_hi, self.re_pending + self.re_step)
+        elif act == 're_save':
+            self.re_saved = self.re_pending = int(
+                self.ctx['apply_restart_hour'](self.re_pending))
         return None
 
     def render(self):
@@ -500,60 +639,47 @@ class FirmwareInfo:
             d.text((240, y), str(v), font=self.f['24'], fill=self.t['fg'])
             y += 42
 
-        # Right column: two stepper controls, screensaver on top of wake sensor.
-        ss_status = (f"Active: after {self.ss_saved} min idle"
-                     if self.ss_pending == self.ss_saved
-                     else f"Tap Save to apply (active: {self.ss_saved} min)")
-        self._stepper(d, 56, "Screensaver Timeout", "Start screensaver after idle:",
-                      f"{self.ss_pending} min", 'ss_',
-                      ss_status, self.ss_pending == self.ss_saved)
+        # --- Right column: automatic daily restart ---
+        px = 760
+        d.text((px, 56), "Automatic Restart", font=self.f['28'], fill=self.t['accent'])
+        d.text((px, 90), "Reboot daily so Wi-Fi recovers from long uptime",
+               font=self.f['20'], fill=self.t['muted'])
 
-        if self.sensor_ok:
-            sn_status = (f"Active: waking within {self.saved} cm"
-                         if self.pending == self.saved
-                         else f"Tap Save to apply (active: {self.saved} cm)")
-            self._stepper(d, 222, "Screen Wake Sensor", "Wake when object is within:",
-                          f"{self.pending} cm", 'sn_',
-                          sn_status, self.pending == self.saved)
-        else:
-            d.text((760, 222), "Screen Wake Sensor", font=self.f['28'], fill=self.t['accent'])
-            d.text((760, 262), "No sensor detected (HC-SR04 not connected)",
-                   font=self.f['20'], fill=self.t['muted'])
+        # On/off toggle, with the current schedule stated beside it.
+        draw_button(d, self.f, self.t, (px, 124, px + 180, 188),
+                    "On" if self.re_enabled else "Off", 're_toggle', self._hits,
+                    'ok' if self.re_enabled else 'normal')
+        state = (f"Restarts daily at {self.re_saved:02d}:00" if self.re_enabled
+                 else "Automatic restart is off")
+        d.text((px + 200, 144), state, font=self.f['24'],
+               fill=self.t['fg'] if self.re_enabled else self.t['muted'])
+
+        # Restart-time stepper (hour of day).
+        re_status = (f"Active: {self.re_saved:02d}:00 daily"
+                     if self.re_pending == self.re_saved
+                     else f"Tap Save to apply (active: {self.re_saved:02d}:00)")
+        draw_stepper(d, self.f, self.t, self._hits, px, 210,
+                     "Restart Time", "Restart the Pi each day at:",
+                     f"{self.re_pending:02d}:00", 're_',
+                     re_status, self.re_pending == self.re_saved)
+
+        # Restart now (two-tap confirm).
+        draw_button(d, self.f, self.t, (px, 374, px + 300, 426),
+                    "Tap to confirm" if self.confirm_reboot else "Restart Now",
+                    'reboot_now', self._hits, 'alert')
 
         draw_button(d, self.f, self.t, (self.w - 260, self.h - 62,
                                         self.w - 24, self.h - 14),
                     "Back", 'back', self._hits)
         return img
 
-    def _stepper(self, d, y, title, hint, value_text, prefix, status, saved):
-        """One [-] value [+] Save control at top-left (760, y). prefix names the
-        hit actions (e.g. 'ss_' -> ss_minus/ss_plus/ss_save)."""
-        px = 760
-        d.text((px, y), title, font=self.f['28'], fill=self.t['accent'])
-        d.text((px, y + 34), hint, font=self.f['20'], fill=self.t['muted'])
-
-        by0 = y + 62
-        by1 = by0 + 64
-        draw_button(d, self.f, self.t, (px, by0, px + 72, by1), "-",
-                    prefix + 'minus', self._hits, 'accent')
-        d.rounded_rectangle((px + 86, by0, px + 300, by1), radius=8,
-                            outline=self.t['muted'], width=1)
-        _text_center(d, px + 193, (by0 + by1) / 2 - self.f['40'].size / 2,
-                     value_text, self.f['40'], self.t['fg'])
-        draw_button(d, self.f, self.t, (px + 314, by0, px + 386, by1), "+",
-                    prefix + 'plus', self._hits, 'accent')
-        draw_button(d, self.f, self.t, (px + 408, by0, px + 600, by1), "Save",
-                    prefix + 'save', self._hits, 'ok')
-
-        d.text((px, by1 + 8), status, font=self.f['20'],
-               fill=self.t['ok'] if saved else self.t['muted'])
-
 
 # --- top-level menu ---------------------------------------------------------
 
 class SettingsUI:
     _ITEMS = [("WiFi", 'wifi'), ("Bluetooth", 'bluetooth'), ("Zip Code", 'zip'),
-              ("Account", 'account'), ("Firmware", 'firmware')]
+              ("Account", 'account'), ("Screensaver", 'screensaver'),
+              ("Firmware", 'firmware')]
 
     def __init__(self, fonts, theme, w, h, ctx):
         self.f, self.t, self.w, self.h, self.ctx = fonts, theme, w, h, ctx
@@ -587,6 +713,8 @@ class SettingsUI:
             return ZipEntry(self.f, self.t, self.w, self.h, self.ctx)
         if key == 'account':
             return AccountInfo(self.f, self.t, self.w, self.h, self.ctx)
+        if key == 'screensaver':
+            return ScreensaverSettings(self.f, self.t, self.w, self.h, self.ctx)
         if key == 'firmware':
             return FirmwareInfo(self.f, self.t, self.w, self.h, self.ctx)
         if key == 'printer':
@@ -642,6 +770,7 @@ class SettingsUI:
             'bluetooth': bt_hint,
             'zip': str(self.ctx['current_zip']() or "-"),
             'account': "Claude / Google",
+            'screensaver': f"{self.ctx['current_screensaver_min']()} min idle",
             'firmware': f"v{self.ctx['app_version']}",
         }
         pad, top, gap = 24, 90, 16

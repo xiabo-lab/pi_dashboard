@@ -64,13 +64,21 @@ class ProximitySensor:
 
     def __init__(self, trigger_pin, echo_pin, threshold_cm=100.0,
                  hysteresis_cm=20.0, poll_interval_s=0.5, refire_gap_s=2.0,
-                 confirm_samples=3, on_detect=None):
+                 confirm_samples=3, trigger_mode='edge', on_detect=None):
         self.threshold_cm = float(threshold_cm)
         self.hysteresis_cm = float(hysteresis_cm)
         self.release_cm = self.threshold_cm + self.hysteresis_cm
         self.poll_interval_s = poll_interval_s
         self.refire_gap_s = refire_gap_s
         self.on_detect = on_detect
+        # 'edge'  - fire once when the target crosses from far to near (needs a
+        #           clean far->near transition; ignores a target that's already
+        #           there). Best when the sensor has a clear approach path.
+        # 'level' - fire on any single reading within threshold, rate-limited by
+        #           refire_gap_s. Catches someone who stops in front and reads as
+        #           a stationary object, at the cost of firing repeatedly while
+        #           they stay (harmless - it just keeps the screen awake).
+        self.trigger_mode = trigger_mode
         # A state change must be seen this many measurements in a row before it
         # commits. The HC-SR04 drops the odd burst - if your hand is angled the
         # echo scatters and the sensor reports whatever fixed object is behind
@@ -83,6 +91,10 @@ class ProximitySensor:
         self._candidate = None # a proposed flip, not yet confirmed
         self._streak = 0       # measurements in a row supporting _candidate
         self._last_fire = 0.0
+        # Most recent measurement, for a live on-screen readout. last_cm is None
+        # when the last ping got no echo (out of range / nothing in the cone).
+        self.last_cm = None
+        self.last_reading_t = 0.0
         self._stop = threading.Event()
         self._trig = self._echo = None
 
@@ -161,8 +173,25 @@ class ProximitySensor:
         reads.sort()
         return reads[len(reads) // 2]
 
+    def _fire(self, cm):
+        """Fire on_detect if the refire gap has elapsed. Returns True if it did."""
+        now = time.monotonic()
+        if now - self._last_fire < self.refire_gap_s:
+            return False
+        self._last_fire = now
+        logging.info("Proximity: object at %.0fcm, waking screen", cm)
+        if self.on_detect:
+            self.on_detect()
+        return True
+
     def _update(self, cm):
         """Fold one distance into the near/far state. Returns True if it fired."""
+        if self.trigger_mode == 'level':
+            # Any reading within threshold wakes, rate-limited by refire_gap_s.
+            self._near = cm <= self.threshold_cm
+            return self._fire(cm) if self._near else False
+
+        # --- 'edge' mode: fire only on a confirmed far->near transition ---
         # Between threshold and release the reading is ambiguous; keep whatever
         # the committed state is so a target hovering on the line doesn't rattle.
         if cm <= self.threshold_cm:
@@ -192,15 +221,10 @@ class ProximitySensor:
         self._candidate = None
         self._streak = 0
 
-        now = time.monotonic()
         # `was is False` (not `not was`) so the first confirmed state, flipping
         # from the initial None, can never fire.
-        if was is False and reading and now - self._last_fire >= self.refire_gap_s:
-            self._last_fire = now
-            logging.info("Proximity: object at %.0fcm, waking screen", cm)
-            if self.on_detect:
-                self.on_detect()
-            return True
+        if was is False and reading:
+            return self._fire(cm)
         return False
 
     def _loop(self):
@@ -212,6 +236,9 @@ class ProximitySensor:
                 logging.warning("Proximity read error: %s; retrying in 2s", e)
                 self._stop.wait(2)
                 continue
+
+            self.last_cm = cm                       # for the on-screen readout
+            self.last_reading_t = time.monotonic()
 
             if cm is None:
                 failures += 1
