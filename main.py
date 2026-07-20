@@ -120,36 +120,21 @@ DATA_WATCHDOG_TIMEOUT_S = 180
 # the screen doesn't also refresh data or flip the theme.
 WAKE_GUARD_SECONDS = 1.5
 
-# Optional HC-SR04 ultrasonic sensor: a second wake source alongside touch, so
+# Optional HC-SR501 PIR motion sensor: a second wake source alongside touch, so
 # walking up to the panel dismisses the screensaver without reaching for it. It
-# fires on *entering* range, so a wall or a chair parked inside the threshold
-# neither wakes the screen nor holds the screensaver off. Pins are BCM numbers;
-# see proximity.py for the wiring, including the mandatory ECHO voltage divider.
-# With the sensor unplugged (or gpiozero absent) the dashboard is unchanged.
+# fires on the OUT line's rising edge (motion starts), so one approach wakes the
+# screen once. The pin is a BCM number; see proximity.py for the wiring (OUT is
+# 3.3V logic and needs no divider). With the sensor unplugged (or gpiozero
+# absent) the dashboard is unchanged - the screensaver still wakes on touch.
+# PROXIMITY_WAKE_ENABLED is the code default for the on/off setting; the
+# Screensaver settings screen toggles it live and persists it to settings.json.
 PROXIMITY_ENABLED = True
-PROXIMITY_TRIGGER_PIN = 23   # header pin 16
-PROXIMITY_ECHO_PIN = 24      # header pin 18, via a 1k/2k divider
-# 20cm, not 100: with nobody in front, this sensor's noise floor scatters around
-# 30-50cm, so a 100cm threshold woke on clutter. A real approach reads <15cm,
-# well clear of the noise, so 20cm fires only on a genuine close approach. This
-# is the code default; the Firmware settings screen can override it (persisted
-# to settings.json, applied live) within the bounds below, in 5cm steps.
-PROXIMITY_WAKE_CM = 20
-PROXIMITY_WAKE_MIN_CM = 5
-PROXIMITY_WAKE_MAX_CM = 200
-PROXIMITY_WAKE_STEP_CM = 5
-# How the sensor decides to wake:
-#   'level' - wake on ANY reading within the distance, even a stationary target
-#             that walks up and stops. More sensitive; may re-wake while present.
-#   'edge'  - wake only on a clean far->near approach (ignores a target already
-#             in range). Needs a clear approach path to the sensor.
-# 'level' suits a sensor glued to the panel where people stop right in front.
-PROXIMITY_TRIGGER_MODE = 'level'
-# Seconds between measurements. Also the worst-case wake latency in level mode.
-# 3s (not 1s): each ping busy-waits on the echo line holding the GIL, so polling
-# less often frees CPU for the render/data threads at the cost of ~2s more wake
-# latency - fine for a screensaver dismiss.
-PROXIMITY_POLL_INTERVAL_S = 3.0
+PROXIMITY_OUT_PIN = 23       # header pin 16 (was the HC-SR04 trigger pin)
+PROXIMITY_WAKE_ENABLED = True
+# Seconds between OUT reads. A rising edge held for less than this could be
+# missed, but the HC-SR501's own hold time keeps OUT high for seconds, so a
+# fast poll here is plenty responsive while staying cheap.
+PROXIMITY_POLL_INTERVAL_S = 0.2
 
 # --- API ENDPOINTS ---
 API_ENDPOINTS = {
@@ -612,7 +597,7 @@ def _save_settings(patch):
 
 def load_runtime_settings():
     """Apply any settings saved from the on-screen menu over the code defaults."""
-    global LOCATION_ZIP, PROXIMITY_WAKE_CM, SCREENSAVER_SECONDS
+    global LOCATION_ZIP, PROXIMITY_WAKE_ENABLED, SCREENSAVER_SECONDS
     global AUTO_RESTART_ENABLED, AUTO_RESTART_HOUR
     try:
         with open(SETTINGS_FILE) as f:
@@ -621,10 +606,10 @@ def load_runtime_settings():
         if isinstance(z, str) and z.strip():
             LOCATION_ZIP = z.strip()
             logging.info(f"Loaded ZIP from settings: {LOCATION_ZIP}")
-        cm = s.get('sensor_wake_cm')
-        if isinstance(cm, (int, float)):
-            PROXIMITY_WAKE_CM = _clamp_wake_cm(cm)
-            logging.info(f"Loaded sensor wake distance from settings: {PROXIMITY_WAKE_CM}cm")
+        on = s.get('sensor_wake_enabled')
+        if isinstance(on, bool):
+            PROXIMITY_WAKE_ENABLED = on
+            logging.info(f"Loaded motion wake from settings: {'on' if on else 'off'}")
         mins = s.get('screensaver_minutes')
         if isinstance(mins, (int, float)):
             SCREENSAVER_SECONDS = _clamp_screensaver_min(mins) * 60
@@ -652,12 +637,6 @@ def apply_zip(new_zip):
         data_store.last_update['geo'] = 0      # force location re-resolve
         data_store.last_update['weather'] = 0  # and an immediate weather refetch
     logging.info(f"ZIP set to {LOCATION_ZIP}")
-
-
-def _clamp_wake_cm(cm):
-    """Round to the nearest 5cm step and clamp to the allowed range. -> int."""
-    cm = int(round(float(cm) / PROXIMITY_WAKE_STEP_CM) * PROXIMITY_WAKE_STEP_CM)
-    return max(PROXIMITY_WAKE_MIN_CM, min(PROXIMITY_WAKE_MAX_CM, cm))
 
 
 def _clamp_screensaver_min(mins):
@@ -759,15 +738,15 @@ def apply_screensaver_min(new_min):
     return mins
 
 
-def apply_sensor_cm(new_cm):
-    """Set the proximity wake distance from the menu, persist it, apply it live."""
-    global PROXIMITY_WAKE_CM
-    PROXIMITY_WAKE_CM = _clamp_wake_cm(new_cm)
-    _save_settings({'sensor_wake_cm': PROXIMITY_WAKE_CM})
+def apply_sensor_enabled(on):
+    """Turn motion-wake on/off from the menu, persist it, apply it live. -> bool."""
+    global PROXIMITY_WAKE_ENABLED
+    PROXIMITY_WAKE_ENABLED = bool(on)
+    _save_settings({'sensor_wake_enabled': PROXIMITY_WAKE_ENABLED})
     if global_sensor is not None:
-        global_sensor.set_threshold(PROXIMITY_WAKE_CM)
-    logging.info(f"Sensor wake distance set to {PROXIMITY_WAKE_CM}cm")
-    return PROXIMITY_WAKE_CM
+        global_sensor.set_enabled(PROXIMITY_WAKE_ENABLED)
+    logging.info(f"Motion wake {'on' if PROXIMITY_WAKE_ENABLED else 'off'}")
+    return PROXIMITY_WAKE_ENABLED
 
 
 def apply_printer_conf(ip, serial, access_code):
@@ -812,12 +791,10 @@ def build_settings_ctx():
         'apply_zip': apply_zip,
         'current_printer': lambda: dict(PRINTER_CONF),
         'apply_printer': apply_printer_conf,
-        'current_sensor_cm': lambda: PROXIMITY_WAKE_CM,
-        'apply_sensor_cm': apply_sensor_cm,
+        'sensor_enabled': lambda: PROXIMITY_WAKE_ENABLED,
+        'apply_sensor_enabled': apply_sensor_enabled,
         'sensor_available': lambda: bool(global_sensor and global_sensor.available),
-        'sensor_bounds': (PROXIMITY_WAKE_MIN_CM, PROXIMITY_WAKE_MAX_CM,
-                          PROXIMITY_WAKE_STEP_CM),
-        'sensor_reading': lambda: (global_sensor.last_cm if global_sensor else None),
+        'sensor_reading': lambda: (global_sensor.motion if global_sensor else None),
         'current_screensaver_min': lambda: SCREENSAVER_SECONDS // 60,
         'apply_screensaver_min': apply_screensaver_min,
         'screensaver_bounds': (SCREENSAVER_MIN_MINUTES, SCREENSAVER_MAX_MINUTES,
@@ -2305,9 +2282,8 @@ def main():
     sensor = None
     if PROXIMITY_ENABLED:
         sensor = proximity.ProximitySensor(
-            PROXIMITY_TRIGGER_PIN, PROXIMITY_ECHO_PIN,
-            threshold_cm=PROXIMITY_WAKE_CM, trigger_mode=PROXIMITY_TRIGGER_MODE,
-            poll_interval_s=PROXIMITY_POLL_INTERVAL_S, on_detect=note_proximity)
+            PROXIMITY_OUT_PIN, poll_interval_s=PROXIMITY_POLL_INTERVAL_S,
+            enabled=PROXIMITY_WAKE_ENABLED, on_detect=note_proximity)
         global_sensor = sensor   # lets the settings menu retune it live
         sensor.start()
 

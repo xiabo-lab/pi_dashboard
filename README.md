@@ -48,7 +48,7 @@ Data comes from [Open-Meteo](https://open-meteo.com/) (no API key). Location res
 * **Tap** anywhere — force an immediate refetch of all data (rate-limited to once per 15 s).
 * **Press & hold ~1.2 s** — toggle the light / dark theme.
 * **Press & hold 5 s** — open the on-screen [Settings menu](#the-on-screen-settings-menu).
-* **Screensaver** — after 10 minutes idle the dashboard is replaced by a drifting clock on black; the next touch brings it straight back. With an [HC-SR04 sensor](#proximity-wake-sensor-optional) fitted, walking up to the panel wakes it too. The idle timeout is adjustable on-screen under **Settings → Firmware** (the code default lives in `SCREENSAVER_SECONDS` in `main.py`; `0` disables it).
+* **Screensaver** — after 10 minutes idle the dashboard is replaced by a drifting clock on black; the next touch brings it straight back. With an [HC-SR501 motion sensor](#motion-wake-sensor-optional) fitted, walking up to the panel wakes it too. The idle timeout is adjustable on-screen under **Settings → Firmware** (the code default lives in `SCREENSAVER_SECONDS` in `main.py`; `0` disables it).
 
 ---
 
@@ -77,31 +77,30 @@ Setup for these lives in [Optional integrations](#optional-integrations).
 * [GeeekPi 11.26" 1920x440 HDMI LCD, capacitive touch](https://wiki.52pi.com/index.php/11.26-inch-1920x440-Capacitive-Touch-Screen)
 * HDMI cable + USB cable — the USB link carries the touch panel, which enumerates as a standard USB HID touchscreen, no driver needed
 * microSD card, 8 GB or larger
-* *(optional)* an **HC-SR04 ultrasonic sensor** to wake the screensaver on approach — see [Proximity wake sensor](#proximity-wake-sensor-optional)
+* *(optional)* an **HC-SR501 PIR motion sensor** to wake the screensaver on approach — see [Motion wake sensor](#motion-wake-sensor-optional)
 
-### Proximity wake sensor (optional)
+### Motion wake sensor (optional)
 
-An HC-SR04 pointed out from the panel wakes the screensaver when you walk up to it, so the dashboard is already showing before you reach the screen. Without it (or if `gpiozero` isn't installed) nothing changes — the screensaver still wakes on touch.
+An HC-SR501 PIR sensor pointed out from the panel wakes the screensaver when it sees you move nearby, so the dashboard is already showing before you reach the screen. Without it (or if `gpiozero` isn't installed) nothing changes — the screensaver still wakes on touch.
 
 Wire it to the Pi's 40-pin header using **BCM** pin numbers:
 
-| HC-SR04 | Pi header | Note |
+| HC-SR501 | Pi header | Note |
 | --- | --- | --- |
-| `VCC` | 5V (pin 2) | the sensor will not fire reliably at 3.3V |
+| `VCC` | 5V (pin 2) | |
 | `GND` | GND (pin 6) | |
-| `TRIG` | GPIO23 (pin 16) | |
-| `ECHO` | GPIO24 (pin 18) | **through a voltage divider — not optional** |
+| `OUT` | GPIO23 (pin 16) | 3.3V logic — connects directly, no divider |
 
-`ECHO` idles at 5V and the Pi's GPIOs are 3.3V-only, so connect it through a divider: a **1 kΩ** resistor in series from `ECHO`, and a **2 kΩ** resistor from that junction (which goes to GPIO24) to GND. That lands GPIO24 at 5 × 2/(1+2) = 3.3V. A bare `ECHO`→GPIO connection will eventually damage the pin.
+The HC-SR501's `OUT` idles at 0V and pulses to 3.3V while it sees motion, so it wires straight to a GPIO. Its two on-board pots set sensitivity and how long `OUT` stays high after a trigger; the jumper picks single/repeat retrigger. Give it ~60s to settle after power-up.
 
 Then install the GPIO libraries and test the wiring before starting the dashboard:
 
 ```bash
 sudo apt install -y python3-gpiozero python3-lgpio
-sudo python3 proximity.py     # live distance readout; prints *** WAKE *** on approach
+sudo python3 proximity.py     # live OUT readout; prints *** WAKE *** on motion
 ```
 
-Once it reads sensible distances, restart the service. The wake distance and screensaver timeout are both adjustable on-screen — see [the Settings menu](#the-on-screen-settings-menu). Pins are set near the top of `main.py` (`PROXIMITY_TRIGGER_PIN`, `PROXIMITY_ECHO_PIN`); set `PROXIMITY_ENABLED = False` to disable the sensor entirely.
+Once it reports motion when you wave, restart the service. Motion wake can be turned on/off on-screen, along with the screensaver timeout — see [the Settings menu](#the-on-screen-settings-menu). The pin is set near the top of `main.py` (`PROXIMITY_OUT_PIN`); set `PROXIMITY_ENABLED = False` to disable the sensor entirely.
 
 ---
 
@@ -240,7 +239,7 @@ Widget toggles (`ENABLE_*`) live at the top of `main.py`. Personal credentials d
 | File | Holds | Created by |
 | --- | --- | --- |
 | `device_conf.json` | Bambu printer IP / serial / access code, Roborock email | you, from `device_conf.example.json` |
-| `settings.json` | Weather ZIP code, screensaver timeout, proximity wake distance | the on-screen Settings menu |
+| `settings.json` | Weather ZIP code, screensaver timeout, motion-wake on/off | the on-screen Settings menu |
 | `claude_creds.json` | Claude OAuth token | `claude.interactive_auth()` |
 | `token.json` | Gmail OAuth token | `gmail_auth.py` |
 
@@ -359,7 +358,7 @@ Hold the screen for **5 seconds** to open it. Five sub-screens, each tile showin
 | **Bluetooth** | Pair a new phone (`Pi_Dashboard`), or forget a paired one |
 | **Zip Code** | Numeric keypad for the weather ZIP; applied immediately |
 | **Account** | The connected Claude and Google accounts; **Edit** opens a keyboard to set the Bambu printer's IP / access code / serial |
-| **Firmware** | App version, hostname, IP, current WiFi, Python version, uptime — plus two live-applied steppers: the **screensaver idle timeout** (1–60 min) and, when an HC-SR04 is fitted, the **screen wake distance** (5–200 cm) |
+| **Firmware** | App version, hostname, IP, current WiFi, Python version, uptime — plus two live-applied steppers: the **screensaver idle timeout** (1–60 min); the **motion-wake on/off** toggle (when an HC-SR501 is fitted) lives on the Screensaver screen |
 
 `Close` returns to the dashboard. Everything runs as root under the service, so there's no sudo prompt. The menu needs the app running under `cage` — it can't be driven over SSH.
 
@@ -442,6 +441,6 @@ If you're coming from [the Waveshare 10.85" build](https://github.com/czuryk/Wav
 * **Colour replaces 1-bit.** Icons load as alpha masks and are painted in whatever colour the theme specifies, so the same `icons/*.bmp` files are reused unmodified. Album art stays full-colour RGB instead of being dithered.
 * **The `signal.SIGALRM` hardware watchdog is gone.** It existed to recover from the e-paper's SPI busy-wait hangs; an HDMI blit cannot hang that way.
 * **The 60-second refresh floor is gone.** That was an e-ink hardware constraint, not a design choice.
-* **New in this fork:** the Bluetooth now-playing widget, the on-screen settings menu (WiFi / Bluetooth / ZIP / account / firmware), the moving-clock screensaver, the optional HC-SR04 proximity wake sensor, and the light theme.
+* **New in this fork:** the Bluetooth now-playing widget, the on-screen settings menu (WiFi / Bluetooth / ZIP / account / firmware), the moving-clock screensaver, the optional HC-SR501 motion wake sensor, and the light theme.
 
 The 3D-printed case and assembly video from the original project were designed for the Waveshare panel and do not fit this one, so they aren't reproduced here — see the [upstream repository](https://github.com/czuryk/Waveshare-ePaper-10.85-dashboard) if you're building the e-paper version.

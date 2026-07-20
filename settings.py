@@ -9,9 +9,9 @@ Opened by a 5-second press (see main.py). Presents a menu of sub-screens:
     Zip Code    - set the ZIP used for weather, via a numeric keypad
     Account     - connected Claude/Google accounts; Edit opens Bambu Printer,
                   a keyboard screen for the printer IP / access code / serial
-    Screensaver - two +/- steppers (applied live and persisted): the screensaver
-                  idle timeout and, when an HC-SR04 is connected, the proximity
-                  sensor's wake distance (with a live reading)
+    Screensaver - screensaver idle-timeout stepper plus, when an HC-SR501 PIR
+                  sensor is connected, a motion-wake on/off toggle (with a live
+                  motion reading); both applied live and persisted
     Firmware    - app version + system info, plus the automatic daily-restart
                   controls (on/off, hour) and a Restart Now button
 
@@ -25,10 +25,10 @@ the menu's Close returns 'exit' to leave settings entirely.
     ctx['apply_zip'](s)                     persist + re-resolve a new ZIP
     ctx['current_printer'] -> {IP,SERIAL,ACCESS_CODE}
     ctx['apply_printer'](ip, serial, code) -> bool   persist + reconnect
-    ctx['current_sensor_cm'] -> int          proximity wake distance
-    ctx['apply_sensor_cm'](cm) -> int        persist + apply live, returns stored
-    ctx['sensor_available']  -> bool         HC-SR04 present?
-    ctx['sensor_bounds']     -> (min, max, step)
+    ctx['sensor_enabled']    -> bool         motion-wake on?
+    ctx['apply_sensor_enabled'](b) -> bool   persist + apply live, returns stored
+    ctx['sensor_available']  -> bool         HC-SR501 present?
+    ctx['sensor_reading']    -> bool|None    live OUT level (True=motion)
     ctx['current_screensaver_min'] -> int    screensaver idle timeout, minutes
     ctx['apply_screensaver_min'](m) -> int   persist + apply live, returns stored
     ctx['screensaver_bounds'] -> (min, max, step)
@@ -96,23 +96,24 @@ def draw_stepper(d, fonts, theme, hits, px, y, title, hint, value_text, prefix,
            fill=theme['ok'] if saved else theme['muted'])
 
 
-def draw_live_reading(d, fonts, theme, cm, active_cm, lx, y):
-    """Live HC-SR04 distance box at (lx, y), aligned with a stepper's value row.
-    Green while within active_cm (would wake), grey otherwise."""
-    near = cm is not None and cm <= active_cm
-    value = f"{cm:.0f} cm" if cm is not None else "-- cm"
+def draw_live_reading(d, fonts, theme, motion, lx, y):
+    """Live HC-SR501 motion box at (lx, y), aligned with the toggle's row.
+    Green while the OUT line reads motion, grey while idle. `motion` is True /
+    False / None (None = not read yet)."""
+    active = motion is True
+    value = "MOTION" if active else ("idle" if motion is False else "--")
 
     d.text((lx, y), "LIVE READING", font=fonts['20'], fill=theme['muted'])
     by0 = y + 62
     by1 = by0 + 64
     d.rounded_rectangle((lx, by0, lx + 260, by1), radius=8,
-                        outline=theme['ok'] if near else theme['muted'],
-                        width=2 if near else 1)
+                        outline=theme['ok'] if active else theme['muted'],
+                        width=2 if active else 1)
     _text_center(d, lx + 130, (by0 + by1) / 2 - fonts['40'].size / 2,
-                 value, fonts['40'], theme['ok'] if near else theme['fg'])
+                 value, fonts['40'], theme['ok'] if active else theme['fg'])
     d.text((lx, by1 + 8),
-           "in range - would wake" if near else "clear",
-           font=fonts['20'], fill=theme['ok'] if near else theme['muted'])
+           "motion - would wake" if active else "clear",
+           font=fonts['20'], fill=theme['ok'] if active else theme['muted'])
 
 
 # --- sub-screens ------------------------------------------------------------
@@ -466,8 +467,8 @@ class BluetoothScreen:
 
 
 class ScreensaverSettings:
-    """Screensaver idle timeout, plus the proximity wake distance when a sensor
-    is present. Two +/- steppers; the wake stepper has a live distance readout."""
+    """Screensaver idle timeout, plus a motion-wake on/off toggle when the PIR
+    sensor is present. The toggle has a live motion readout beside it."""
 
     def __init__(self, fonts, theme, w, h, ctx):
         self.f, self.t, self.w, self.h, self.ctx = fonts, theme, w, h, ctx
@@ -479,13 +480,11 @@ class ScreensaverSettings:
         self.ss_pending = int(ctx['current_screensaver_min']())
         self.ss_saved = self.ss_pending
 
-        # Proximity wake distance (cm) - editable only when the sensor is present.
-        self.lo, self.hi, self.step = ctx.get('sensor_bounds', (5, 200, 5))
+        # Motion-wake on/off - editable only when the sensor is present.
         self.sensor_ok = ctx['sensor_available']()
-        self.pending = int(ctx['current_sensor_cm']())  # value being edited
-        self.saved = self.pending                        # last persisted value
+        self.enabled = bool(ctx['sensor_enabled']())
         # Repaint continuously when a sensor is present, so the live reading
-        # next to the wake stepper keeps updating without needing a tap.
+        # next to the toggle keeps updating without needing a tap.
         self.animating = self.sensor_ok
 
     def _hit(self, x, y):
@@ -501,7 +500,7 @@ class ScreensaverSettings:
         self.dirty = True
         if act == 'back':
             return 'back'
-        # Screensaver timeout stepper (ss_) and wake distance stepper (sn_).
+        # Screensaver timeout stepper (ss_) and motion-wake toggle (sn_toggle).
         if act == 'ss_minus':
             self.ss_pending = max(self.ss_lo, self.ss_pending - self.ss_step)
         elif act == 'ss_plus':
@@ -509,13 +508,9 @@ class ScreensaverSettings:
         elif act == 'ss_save':
             self.ss_saved = self.ss_pending = int(
                 self.ctx['apply_screensaver_min'](self.ss_pending))
-        elif act == 'sn_minus':
-            self.pending = max(self.lo, self.pending - self.step)
-        elif act == 'sn_plus':
-            self.pending = min(self.hi, self.pending + self.step)
-        elif act == 'sn_save':
-            # apply_sensor_cm clamps/rounds and returns the value actually stored.
-            self.saved = self.pending = int(self.ctx['apply_sensor_cm'](self.pending))
+        elif act == 'sn_toggle':
+            # apply_sensor_enabled persists + applies live, returns the new state.
+            self.enabled = bool(self.ctx['apply_sensor_enabled'](not self.enabled))
         return None
 
     def render(self):
@@ -533,18 +528,23 @@ class ScreensaverSettings:
                      ss_status, self.ss_pending == self.ss_saved)
 
         if self.sensor_ok:
-            sn_status = (f"Active: waking within {self.saved} cm"
-                         if self.pending == self.saved
-                         else f"Tap Save to apply (active: {self.saved} cm)")
-            draw_stepper(d, self.f, self.t, self._hits, 40, 240,
-                         "Screen Wake Sensor", "Wake when object is within:",
-                         f"{self.pending} cm", 'sn_',
-                         sn_status, self.pending == self.saved)
+            d.text((40, 240), "Motion Sensor", font=self.f['28'], fill=self.t['accent'])
+            d.text((40, 274), "Wake the screen when motion is detected:",
+                   font=self.f['20'], fill=self.t['muted'])
+            # On/off toggle, with the current state stated beside it.
+            draw_button(d, self.f, self.t, (40, 302, 220, 366),
+                        "On" if self.enabled else "Off", 'sn_toggle', self._hits,
+                        'ok' if self.enabled else 'normal')
+            d.text((240, 322),
+                   "Motion wakes the screen" if self.enabled
+                   else "Motion wake is off",
+                   font=self.f['24'],
+                   fill=self.t['fg'] if self.enabled else self.t['muted'])
             draw_live_reading(d, self.f, self.t, self.ctx['sensor_reading'](),
-                              self.saved, 760, 240)
+                              760, 240)
         else:
-            d.text((40, 240), "Screen Wake Sensor", font=self.f['28'], fill=self.t['accent'])
-            d.text((40, 280), "No sensor detected (HC-SR04 not connected)",
+            d.text((40, 240), "Motion Sensor", font=self.f['28'], fill=self.t['accent'])
+            d.text((40, 280), "No sensor detected (HC-SR501 not connected)",
                    font=self.f['20'], fill=self.t['muted'])
 
         draw_button(d, self.f, self.t, (self.w - 260, self.h - 62,
